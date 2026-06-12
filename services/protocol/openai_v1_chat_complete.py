@@ -140,12 +140,18 @@ def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], li
     """Returns (model, messages, tools_or_None)."""
     model = str(body.get("model") or "auto").strip() or "auto"
     tools = body.get("tools")
+    tool_choice = body.get("tool_choice", "auto")
+    parallel_tool_calls = body.get("parallel_tool_calls", True)
     raw_body_messages = chat_messages_from_body(body)
-    if isinstance(tools, list) and tools:
+    if isinstance(tools, list) and tools and tool_choice != "none":
         raw_body_messages = normalize_tool_history(raw_body_messages)
     raw_messages = normalize_text_messages(normalize_messages(raw_body_messages))
-    if isinstance(tools, list) and tools:
-        raw_messages.insert(0, tools_system_message(tools))
+    if isinstance(tools, list) and tools and tool_choice != "none":
+        raw_messages.insert(0, tools_system_message(
+            tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=bool(parallel_tool_calls),
+        ))
         return model, raw_messages, tools
     return model, raw_messages, None
 
