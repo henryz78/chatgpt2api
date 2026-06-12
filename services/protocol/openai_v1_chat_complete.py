@@ -21,18 +21,20 @@ from services.protocol.conversation import (
     stream_text_deltas,
     text_backend,
 )
+from services.protocol.tool_calling import (
+    has_tools,
+    normalize_tool_history,
+    parse_tool_calls,
+    stream_tool_calls_chunks,
+    tool_calls_response,
+    tools_system_message,
+)
 from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
     count_image_output_items_tokens,
     image_usage,
-)
-
-TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
-    "This compatibility backend cannot execute local tools, shell commands, web searches, "
-    "or file operations. Do not claim to have run tools or inspected external resources. "
-    "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
 
 
@@ -134,13 +136,18 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
     return model, prompt, parse_image_count(body.get("n")), images
 
 
-def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Returns (model, messages, tools_or_None)."""
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
     tools = body.get("tools")
+    raw_body_messages = chat_messages_from_body(body)
     if isinstance(tools, list) and tools:
-        messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
-    return model, messages
+        raw_body_messages = normalize_tool_history(raw_body_messages)
+    raw_messages = normalize_text_messages(normalize_messages(raw_body_messages))
+    if isinstance(tools, list) and tools:
+        raw_messages.insert(0, tools_system_message(tools))
+        return model, raw_messages, tools
+    return model, raw_messages, None
 
 
 def image_result_content(result: dict[str, Any]) -> str:
@@ -207,11 +214,35 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
+def _text_with_tools_response(model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
+    tool_calls = parse_tool_calls(full_text)
+    if tool_calls:
+        return tool_calls_response(model, tool_calls)
+    return completion_response(model, full_text, messages=messages)
+
+
+def _text_with_tools_stream(model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
+    tool_calls = parse_tool_calls(full_text)
+    if tool_calls:
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        yield from stream_tool_calls_chunks(model, tool_calls, completion_id, created)
+    else:
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        yield completion_chunk(model, {"role": "assistant", "content": full_text}, None, completion_id, created)
+        yield completion_chunk(model, {}, "stop", completion_id, created)
+
+
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)
-        model, messages = text_chat_parts(body)
+        model, messages, tools = text_chat_parts(body)
+        if tools:
+            return _text_with_tools_stream(model, messages, tools)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
@@ -219,7 +250,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
-    model, messages = text_chat_parts(body)
+    model, messages, tools = text_chat_parts(body)
+    if tools:
+        return _text_with_tools_response(model, messages, tools)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
