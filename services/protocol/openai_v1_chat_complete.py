@@ -23,13 +23,20 @@ from services.protocol.conversation import (
 )
 from services.protocol.tool_calling import (
     enforce_tool_choice,
-    has_tools,
     normalize_legacy_body,
     normalize_tool_history,
     parse_tool_calls,
     stream_tool_calls_chunks,
     tool_calls_response,
     tools_system_message,
+)
+from services.protocol.web_search_tool import (
+    WEB_SEARCH_TOOL_TYPES,
+    has_unsupported_tools,
+    is_web_search_chat_request,
+    run_web_search,
+    search_query_from_messages,
+    text_with_url_citations,
 )
 from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
 from utils.image_tokens import (
@@ -38,6 +45,22 @@ from utils.image_tokens import (
     count_image_output_items_tokens,
     image_usage,
 )
+
+TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
+    "This compatibility backend cannot execute local tools, shell commands, non-search tools, "
+    "or file operations. Do not claim to have run tools or inspected external resources. "
+    "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
+)
+
+
+def _tool_calling_tools(tools: object) -> list[dict[str, Any]] | None:
+    if not isinstance(tools, list):
+        return None
+    supported = [
+        tool for tool in tools
+        if isinstance(tool, dict) and tool.get("type") in {"function", "custom"}
+    ]
+    return supported or None
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -55,11 +78,15 @@ def completion_response(
     content: str,
     created: int | None = None,
     messages: list[dict[str, Any]] | None = None,
+    annotations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     prompt_text_tokens = count_message_text_tokens(messages, model) if messages else 0
     prompt_image_tokens = count_message_image_tokens(messages, model) if messages else 0
     prompt_tokens = prompt_text_tokens + prompt_image_tokens
     completion_tokens = count_text_tokens(content, model) if messages else 0
+    message = {"role": "assistant", "content": content}
+    if annotations:
+        message["annotations"] = annotations
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -67,7 +94,7 @@ def completion_response(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
+            "message": message,
             "finish_reason": "stop",
         }],
         "usage": {
@@ -144,21 +171,64 @@ def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], li
     body = normalize_legacy_body(body)
 
     model = str(body.get("model") or "auto").strip() or "auto"
-    tools = body.get("tools")
+    tools = _tool_calling_tools(body.get("tools"))
     tool_choice = body.get("tool_choice", "auto")
     parallel_tool_calls = body.get("parallel_tool_calls", True)
     raw_body_messages = chat_messages_from_body(body)
-    if isinstance(tools, list) and tools and tool_choice != "none":
+    if tools and tool_choice != "none":
         raw_body_messages = normalize_tool_history(raw_body_messages)
     raw_messages = normalize_text_messages(normalize_messages(raw_body_messages))
-    if isinstance(tools, list) and tools and tool_choice != "none":
+    if tools and tool_choice != "none":
         raw_messages.insert(0, tools_system_message(
             tools,
             tool_choice=tool_choice,
             parallel_tool_calls=bool(parallel_tool_calls),
         ))
         return model, raw_messages, tools, tool_choice, bool(parallel_tool_calls)
+    if has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
+        raw_messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, raw_messages, None, tool_choice, bool(parallel_tool_calls)
+
+
+def chat_completion_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for item in annotations:
+        if item.get("type") != "url_citation":
+            continue
+        output.append({
+            "type": "url_citation",
+            "url_citation": {
+                "start_index": item.get("start_index", 0),
+                "end_index": item.get("end_index", 0),
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+            },
+        })
+    return output
+
+
+def web_search_chat_response(messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    query = search_query_from_messages(messages)
+    if not query:
+        raise HTTPException(status_code=400, detail={"error": "messages or prompt is required for web search"})
+    text, annotations = text_with_url_citations(run_web_search(query))
+    return completion_response(
+        model,
+        text,
+        messages=messages,
+        annotations=chat_completion_annotations(annotations),
+    )
+
+
+def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+    query = search_query_from_messages(messages)
+    if not query:
+        raise HTTPException(status_code=400, detail={"error": "messages or prompt is required for web search"})
+    text, _annotations = text_with_url_citations(run_web_search(query))
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    yield completion_chunk(model, {"role": "assistant", "content": text}, None, completion_id, created)
+    yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
 def image_result_content(result: dict[str, Any]) -> str:
@@ -307,6 +377,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         model, messages, tools, tool_choice, parallel_tool_calls = text_chat_parts(body)
         if tools:
             return _text_with_tools_stream(model, messages, tools, tool_choice, parallel_tool_calls)
+        if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
+            return stream_web_search_chat_completion(messages, model)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
@@ -317,6 +389,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     model, messages, tools, tool_choice, parallel_tool_calls = text_chat_parts(body)
     if tools:
         return _text_with_tools_response(model, messages, tools, tool_choice, parallel_tool_calls)
+    if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
+        return web_search_chat_response(messages, model)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
