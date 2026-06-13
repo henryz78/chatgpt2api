@@ -116,7 +116,7 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
-        self.assertEqual(images, [(PNG_BYTES, "image_url.png", "image/png")])
+        self.assertEqual(images, [(PNG_BYTES, "image_1.png", "image/png")])
 
     def test_list_tasks_reports_missing_ids(self):
         response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)

@@ -59,6 +59,11 @@ class FakeProxySettings:
         self.refreshed = self.bundle is not None
         return self.bundle
 
+    def get_profile(self, proxy="", upstream=False, **kwargs):
+        class _FakeProfile:
+            clearance_enabled = True
+        return _FakeProfile()
+
 
 class RegisterProxyRuntimeTests(unittest.TestCase):
     def test_create_session_uses_proxy_settings_without_breaking_existing_proxy_argument(self):

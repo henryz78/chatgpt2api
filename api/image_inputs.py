@@ -134,7 +134,9 @@ def _sources_from_value(value: object) -> list[ImageSource]:
         text = value.strip()
         if not text:
             return []
-        if text.lower().startswith(("data:", "http://", "https://")):
+        if text.lower().startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail={"error": "remote image URLs are not supported"})
+        if text.lower().startswith("data:"):
             return [text]
         return [_decode_base64_image(text, "image.png", "image/png")]
     if isinstance(value, list):
@@ -305,5 +307,10 @@ async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
             continue
         images.append(await run_in_threadpool(_download_image_url, source))
     if not images:
-        raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
-    return images
+        raise HTTPException(status_code=400, detail={"error": "image file is required"})
+    result: list[ImageInput] = []
+    for i, (data, filename, mime_type) in enumerate(images):
+        if filename.startswith("image_url."):
+            filename = f"image_{i + 1}.{filename[len('image_url.'):]}"
+        result.append((data, filename, mime_type))
+    return result
