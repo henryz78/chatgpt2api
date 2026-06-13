@@ -812,3 +812,103 @@ class TestStreamToolCallsChunks:
         indices = [tcd["index"] for tcd in tc_deltas if "index" in tcd]
         assert 0 in indices
         assert 1 in indices
+
+
+# ── Regression tests for reviewed bug fixes ────────────────────────────────────
+
+class TestCodeFenceRegression:
+    """Bug fix: parse_tool_calls was stripping all code fences before parsing,
+    causing valid tool calls whose arguments contain triple backticks to return None."""
+
+    def test_tool_call_inside_code_fence(self):
+        """A tool call that is entirely inside a code fence is treated as a
+        documentation example and is NOT parsed as a real call."""
+        text = '```\n<tool_calls>[{"name": "run_code", "arguments": {"code": "print(1)"}}]</tool_calls>\n```'
+        result = parse_tool_calls(text)
+        assert result is None
+
+    def test_tool_call_args_contain_backticks(self):
+        """Tool arguments contain triple backticks (e.g. write_file with markdown) — must not be erased."""
+        args = {"path": "README.md", "content": "```python\nprint('hello')\n```"}
+        text = f'<tool_calls>[{{"name": "write_file", "arguments": {json.dumps(args)}}}]</tool_calls>'
+        result = parse_tool_calls(text)
+        assert result is not None
+        assert result[0]["function"]["name"] == "write_file"
+        parsed_args = json.loads(result[0]["function"]["arguments"])
+        assert "```python" in parsed_args["content"]
+
+    def test_example_in_code_fence_not_parsed_when_no_real_call(self):
+        """Example tool call inside a fenced block in plain assistant text is NOT treated as real.
+        The only match is fully contained in a fence → treated as documentation → None."""
+        text = (
+            "Here is an example of how to call tools:\n"
+            "```\n"
+            '<tool_calls>[{"name": "example_tool", "arguments": {}}]</tool_calls>\n'
+            "```\n"
+            "Use the format above when you need to call a tool."
+        )
+        result = parse_tool_calls(text)
+        assert result is None
+
+    def test_real_call_outside_fence_takes_priority(self):
+        """Real tool call outside a fence is found on first pass; fenced example is ignored."""
+        real = '<tool_calls>[{"name": "real_tool", "arguments": {"x": 1}}]</tool_calls>'
+        example = '```\n<tool_calls>[{"name": "example_tool", "arguments": {}}]</tool_calls>\n```'
+        text = f"Here is an example: {example}\n\nActual call:\n{real}"
+        result = parse_tool_calls(text)
+        assert result is not None
+        # example_tool appears first in document order but is fully inside a fence
+        # → skipped.  real_tool is outside any fence → preferred.
+        assert result[0]["function"]["name"] == "real_tool"
+
+
+class TestNormalizeLegacyBodyFunctionCallOnly:
+    """Bug fix: normalize_legacy_body returned early if `functions` was absent,
+    so a body carrying only `function_call` was not converted to `tool_choice`."""
+
+    def test_function_call_only_none(self):
+        """function_call='none' without functions → tool_choice='none'"""
+        body = {"model": "gpt-4", "function_call": "none"}
+        result = normalize_legacy_body(body)
+        assert "function_call" not in result
+        assert result["tool_choice"] == "none"
+
+    def test_function_call_only_auto(self):
+        body = {"model": "gpt-4", "function_call": "auto"}
+        result = normalize_legacy_body(body)
+        assert result["tool_choice"] == "auto"
+
+    def test_function_call_only_named(self):
+        body = {"model": "gpt-4", "function_call": {"name": "get_weather"}}
+        result = normalize_legacy_body(body)
+        assert result["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
+
+    def test_function_call_with_functions_both_converted(self):
+        """When both fields are present, both are converted."""
+        body = {
+            "model": "gpt-4",
+            "functions": [{"name": "f", "parameters": {"type": "object", "properties": {}}}],
+            "function_call": {"name": "f"},
+        }
+        result = normalize_legacy_body(body)
+        assert "functions" not in result
+        assert "function_call" not in result
+        assert result["tools"][0]["function"]["name"] == "f"
+        assert result["tool_choice"] == {"type": "function", "function": {"name": "f"}}
+
+    def test_no_legacy_fields_unchanged(self):
+        body = {"model": "gpt-4", "messages": []}
+        result = normalize_legacy_body(body)
+        assert result is body  # same object, not a copy
+
+    def test_function_call_does_not_overwrite_existing_tool_choice(self):
+        """Existing tool_choice is preserved; function_call is just removed."""
+        body = {"function_call": "auto", "tool_choice": "required"}
+        result = normalize_legacy_body(body)
+        assert result["tool_choice"] == "required"
+        assert "function_call" not in result
+
+    def test_input_not_mutated(self):
+        original = {"function_call": "none"}
+        normalize_legacy_body(original)
+        assert "function_call" in original  # original dict untouched

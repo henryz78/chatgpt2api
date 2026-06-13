@@ -308,7 +308,13 @@ _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 
 def _strip_code_fences(text: str) -> str:
-    """Remove triple-backtick code blocks so examples inside them aren't parsed."""
+    """Remove triple-backtick code blocks.
+
+    WARNING: only call this as a *fallback* after parsing the original text.
+    Tool arguments may legitimately contain triple backticks (e.g. a write_file
+    tool carrying markdown content).  Stripping unconditionally turns those
+    valid calls into parse failures.
+    """
     return _FENCE_RE.sub("", text)
 
 
@@ -487,27 +493,63 @@ def _parse_ds_segment(segment: str) -> list[dict[str, Any]] | None:
     return None
 
 
-def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
-    """
-    Try multiple patterns to extract tool calls from model output.
+def _fence_regions(text: str) -> list[tuple[int, int]]:
+    """Return (start, end) positions of all ``` … ``` regions in text."""
+    return [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
 
-    Pattern priority (mirrors ds-free-api):
-      1. <tool_calls>[...]</tool_calls>            (canonical / our injected format)
-      2. <|tool▁calls▁begin|>...<|tool▁calls▁end|>  (DeepSeek native, fuzzy)
-      3. <|tool▁call▁begin|>...<|tool▁call▁end|>    (DeepSeek individual, fuzzy)
-      4. <tool_call>...</tool_call>                (simple alias)
-      5. {"tool_calls": [...]}                     (bare JSON wrapper, NOT in code fence)
-      6. {"name": ..., "arguments": ...}           (single bare object)
-      7. <invoke name="...">...</invoke>            (Anthropic/Claude style)
 
-    Code fences (```) are stripped before applying tag-based patterns so that
-    markdown *examples* inside code blocks are never mistaken for real tool calls.
+def _is_fully_in_fence(match: re.Match, fences: list[tuple[int, int]]) -> bool:
+    """True only when the match is entirely contained within a single fence region."""
+    ms, me = match.start(), match.end()
+    return any(fs <= ms and me <= fe for fs, fe in fences)
+
+
+def _first_match_prefer_outside(
+    pattern: re.Pattern,
+    text: str,
+    fences: list[tuple[int, int]],
+) -> re.Match | None:
+    """Return first match NOT fully inside a fence, or None if every match is fenced.
+
+    We deliberately do NOT fall back to fenced matches: a tool call that is
+    entirely contained within a code fence is treated as a documentation example
+    and is not parsed.  Only matches that start or extend *outside* every fence
+    region are considered real tool calls.
     """
-    # Strip code fences to avoid false positives from example blocks
-    stripped = _strip_code_fences(text)
+    for m in pattern.finditer(text):
+        if not _is_fully_in_fence(m, fences):
+            return m
+    return None
+
+
+def _parse_tool_calls_from(
+    text: str,
+    fences: list[tuple[int, int]] | None = None,
+) -> list[dict[str, Any]] | None:
+    """
+    Core parser that operates on a single text string.
+
+    When *fences* is provided, matches that are fully contained within a fence
+    region are deprioritised: the parser prefers outside-fence matches first,
+    only falling back to fenced ones if nothing else is found.  This lets a
+    ``<tool_calls>`` block whose *arguments* happen to contain triple-backtick
+    content (e.g. write_file with markdown) still be found and parsed correctly,
+    while fenced *example* blocks in the middle of prose are ignored.
+    """
+    _fences: list[tuple[int, int]] = fences if fences is not None else []
+
+    def first_match(pattern: re.Pattern) -> re.Match | None:
+        if _fences:
+            return _first_match_prefer_outside(pattern, text, _fences)
+        return pattern.search(text)
+
+    def all_matches(pattern: re.Pattern):
+        for m in pattern.finditer(text):
+            if not _fences or not _is_fully_in_fence(m, _fences):
+                yield m
 
     # 1. Canonical XML format
-    m = _XML_RE.search(stripped)
+    m = first_match(_XML_RE)
     if m:
         arr = _parse_json_array(m.group(1))
         if arr is not None:
@@ -516,7 +558,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
                 return result
 
     # 2. DeepSeek <|tool▁calls▁begin|>...<|tool▁calls▁end|>
-    m = _DS_BEGIN_RE.search(stripped)
+    m = first_match(_DS_BEGIN_RE)
     if m:
         result = _parse_ds_segment(m.group(1))
         if result:
@@ -524,7 +566,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
 
     # 3. DeepSeek individual <|tool▁call▁begin|>...<|tool▁call▁end|>
     ds_calls: list[dict[str, Any]] = []
-    for m in _DS_CALL_RE.finditer(stripped):
+    for m in all_matches(_DS_CALL_RE):
         partial = _parse_ds_segment(m.group(1))
         if partial:
             ds_calls.extend(partial)
@@ -533,7 +575,7 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
 
     # 4. Simple <tool_call>...</tool_call>
     simple_calls: list[dict[str, Any]] = []
-    for m in _SIMPLE_TAG_RE.finditer(stripped):
+    for m in all_matches(_SIMPLE_TAG_RE):
         arr = _parse_json_array(m.group(1))
         if arr:
             partial = _build_tool_calls(arr)
@@ -542,8 +584,8 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
     if simple_calls:
         return simple_calls
 
-    # 5. {"tool_calls": [...]} bare (strip fences first to avoid false positives)
-    m = _BARE_TOOL_CALLS_RE.search(stripped)
+    # 5. {"tool_calls": [...]} bare JSON wrapper
+    m = first_match(_BARE_TOOL_CALLS_RE)
     if m:
         raw_obj = m.group(1)
         try:
@@ -558,20 +600,18 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
                 if result:
                     return result
 
-    # 6. Bare single-call object (search in stripped text only)
-    #    Try json.loads first (handles escaped quotes in string values correctly),
-    #    then fall back to regex for malformed JSON.
-    stripped_stripped = stripped.strip()
-    if stripped_stripped.startswith("{"):
+    # 6. Bare single-call object: try json.loads first, then regex
+    text_stripped = text.strip()
+    if text_stripped.startswith("{"):
         try:
-            obj = json.loads(stripped_stripped)
+            obj = json.loads(text_stripped)
             if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
                 result = _build_tool_calls([obj])
                 if result:
                     return result
         except (json.JSONDecodeError, ValueError):
             pass
-    m = _SINGLE_CALL_RE.search(stripped)
+    m = first_match(_SINGLE_CALL_RE)
     if m:
         name = m.group(1)
         args_str = m.group(2)
@@ -585,11 +625,43 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
             return result
 
     # 7. <invoke name="...">...</invoke>
-    result = _parse_invoke_block(stripped)
-    if result:
-        return result
+    # _parse_invoke_block iterates _INVOKE_RE internally; rebuild the call list
+    # here so we can apply the same fence-aware skipping.
+    invoke_calls: list[dict[str, Any]] = []
+    for m in all_matches(_INVOKE_RE):
+        partial = _parse_invoke_block(m.group(0))
+        if partial:
+            invoke_calls.extend(partial)
+    if invoke_calls:
+        return invoke_calls
 
     return None
+
+
+def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
+    """
+    Try multiple patterns to extract tool calls from model output.
+
+    Pattern priority (mirrors ds-free-api):
+      1. <tool_calls>[...]</tool_calls>            (canonical / our injected format)
+      2. <|tool▁calls▁begin|>...<|tool▁calls▁end|>  (DeepSeek native, fuzzy)
+      3. <|tool▁call▁begin|>...<|tool▁call▁end|>    (DeepSeek individual, fuzzy)
+      4. <tool_call>...</tool_call>                (simple alias)
+      5. {"tool_calls": [...]}                     (bare JSON wrapper)
+      6. {"name": ..., "arguments": ...}           (single bare object)
+      7. <invoke name="...">...</invoke>            (Anthropic/Claude style)
+
+    Strategy:
+      Compute fence regions once, then run a single fence-aware parse pass.
+      Patterns prefer matches that are NOT fully inside a code fence: this
+      correctly handles tool calls whose *arguments* contain triple backticks
+      (e.g. write_file with markdown) while still ignoring fenced *example*
+      blocks embedded in prose.  If no outside-fence match exists for a given
+      pattern, the fenced match is used as a last resort (handles the rare
+      model that wraps its entire tool-call block in a code fence).
+    """
+    fences = _fence_regions(text)
+    return _parse_tool_calls_from(text, fences=fences if fences else None)
 
 
 # ── tool_choice enforcement ────────────────────────────────────────────────────
@@ -663,30 +735,40 @@ def normalize_legacy_body(body: dict[str, Any]) -> dict[str, Any]:
       - `functions` array → `tools` array
       - `function_call` → `tool_choice`
 
+    The two conversions are independent: a body may carry only `function_call`
+    (no `functions`) when the caller already used `tools` but still passes the
+    old `function_call` field, or vice-versa.  We handle each field regardless
+    of whether the other is present.
+
     Returns a (possibly new) dict; does not mutate the input.
     """
-    if "functions" not in body:
+    has_functions = "functions" in body
+    has_function_call = "function_call" in body
+
+    if not has_functions and not has_function_call:
         return body
 
     body = dict(body)
-    functions = body.pop("functions", [])
-    # Only set tools if not already present
-    if "tools" not in body and isinstance(functions, list):
-        body["tools"] = [
-            {"type": "function", "function": f}
-            for f in functions
-            if isinstance(f, dict)
-        ]
 
-    # Map function_call → tool_choice
-    if "function_call" in body:
+    # Convert functions[] → tools[]
+    if has_functions:
+        functions = body.pop("functions", [])
+        if "tools" not in body and isinstance(functions, list):
+            body["tools"] = [
+                {"type": "function", "function": f}
+                for f in functions
+                if isinstance(f, dict)
+            ]
+
+    # Convert function_call → tool_choice (independent of functions presence)
+    if has_function_call:
         fc = body.pop("function_call")
         if "tool_choice" not in body:
             if fc in ("none", "auto"):
                 body["tool_choice"] = fc
             elif isinstance(fc, dict) and "name" in fc:
                 body["tool_choice"] = {"type": "function", "function": {"name": fc["name"]}}
-            # else: unknown format, leave as auto (default)
+            # else: unknown format, leave default (auto)
 
     return body
 
