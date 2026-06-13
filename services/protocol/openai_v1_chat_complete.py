@@ -22,7 +22,9 @@ from services.protocol.conversation import (
     text_backend,
 )
 from services.protocol.tool_calling import (
+    enforce_tool_choice,
     has_tools,
+    normalize_legacy_body,
     normalize_tool_history,
     parse_tool_calls,
     stream_tool_calls_chunks,
@@ -136,8 +138,11 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
     return model, prompt, parse_image_count(body.get("n")), images
 
 
-def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None]:
-    """Returns (model, messages, tools_or_None)."""
+def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None, Any, bool]:
+    """Returns (model, messages, tools_or_None, tool_choice, parallel_tool_calls)."""
+    # Normalise legacy functions/function_call first
+    body = normalize_legacy_body(body)
+
     model = str(body.get("model") or "auto").strip() or "auto"
     tools = body.get("tools")
     tool_choice = body.get("tool_choice", "auto")
@@ -152,8 +157,8 @@ def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], li
             tool_choice=tool_choice,
             parallel_tool_calls=bool(parallel_tool_calls),
         ))
-        return model, raw_messages, tools
-    return model, raw_messages, None
+        return model, raw_messages, tools, tool_choice, bool(parallel_tool_calls)
+    return model, raw_messages, None, tool_choice, bool(parallel_tool_calls)
 
 
 def image_result_content(result: dict[str, Any]) -> str:
@@ -220,25 +225,92 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
-def _text_with_tools_response(model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+def _text_with_tools_response(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: Any,
+    parallel_tool_calls: bool,
+) -> dict[str, Any]:
     full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
-    tool_calls = parse_tool_calls(full_text)
+    raw_tool_calls = parse_tool_calls(full_text)
+    tool_calls, err = enforce_tool_choice(raw_tool_calls, tool_choice, tools, parallel_tool_calls)
+
+    if err:
+        # Return a diagnosable error response for tool_choice violations
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "message": err,
+                    "type": "tool_choice_error",
+                    "code": "tool_choice_not_satisfied",
+                    "raw_response": full_text,
+                }
+            },
+        )
+
     if tool_calls:
-        return tool_calls_response(model, tool_calls)
+        return tool_calls_response(model, tool_calls, messages=messages, full_text=full_text)
     return completion_response(model, full_text, messages=messages)
 
 
-def _text_with_tools_stream(model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+def _text_with_tools_stream(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: Any,
+    parallel_tool_calls: bool,
+) -> Iterator[dict[str, Any]]:
     full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
-    tool_calls = parse_tool_calls(full_text)
+    raw_tool_calls = parse_tool_calls(full_text)
+    tool_calls, err = enforce_tool_choice(raw_tool_calls, tool_choice, tools, parallel_tool_calls)
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    if err:
+        # Emit a special error chunk then stop — clients can detect finish_reason="error"
+        yield {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": None},
+                "finish_reason": "error",
+            }],
+            "error": {
+                "message": err,
+                "type": "tool_choice_error",
+                "code": "tool_choice_not_satisfied",
+            },
+        }
+        return
+
     if tool_calls:
-        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
-        yield from stream_tool_calls_chunks(model, tool_calls, completion_id, created)
+        # Calculate usage for the stream's final chunk
+        prompt_tokens = count_message_text_tokens(messages, model)
+        completion_tokens = count_text_tokens(full_text, model)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        yield from stream_tool_calls_chunks(model, tool_calls, completion_id, created, usage=usage)
     else:
-        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
-        yield completion_chunk(model, {"role": "assistant", "content": full_text}, None, completion_id, created)
+        # No tool call detected — stream plain text response
+        first = True
+        for char_start in range(0, len(full_text), 32):
+            piece = full_text[char_start: char_start + 32]
+            if first:
+                first = False
+                yield completion_chunk(model, {"role": "assistant", "content": piece}, None, completion_id, created)
+            else:
+                yield completion_chunk(model, {"content": piece}, None, completion_id, created)
+        if first:
+            yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
         yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
@@ -246,9 +318,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)
-        model, messages, tools = text_chat_parts(body)
+        model, messages, tools, tool_choice, parallel_tool_calls = text_chat_parts(body)
         if tools:
-            return _text_with_tools_stream(model, messages, tools)
+            return _text_with_tools_stream(model, messages, tools, tool_choice, parallel_tool_calls)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
@@ -256,9 +328,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
-    model, messages, tools = text_chat_parts(body)
+    model, messages, tools, tool_choice, parallel_tool_calls = text_chat_parts(body)
     if tools:
-        return _text_with_tools_response(model, messages, tools)
+        return _text_with_tools_response(model, messages, tools, tool_choice, parallel_tool_calls)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
