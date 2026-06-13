@@ -78,6 +78,22 @@ TOOLS_FIXTURE = [
     },
 ]
 
+CUSTOM_TOOLS_FIXTURE = [
+    {
+        "type": "custom",
+        "custom": {
+            "name": "code_exec",
+            "description": "Run code in a sandbox",
+            "format": {
+                "type": "grammar",
+                "grammar": {"syntax": "lark", "definition": "start: /.+/"},
+            },
+        },
+    },
+    TOOLS_FIXTURE[0],
+    TOOLS_FIXTURE[1],
+]
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -246,6 +262,20 @@ class TestParseToolCallsDSFreeAPIStyle:
         assert result is not None
         assert _call_name(result[0]) == "search"
 
+    def test_ds_multiple_individual_call_blocks(self):
+        """Multiple DeepSeek individual call blocks should all be preserved."""
+        text = (
+            "<|tool▁call▁begin|>"
+            '{"name": "get_weather", "arguments": {"city": "Paris"}}'
+            "<|tool▁call▁end|>"
+            "<|tool▁call▁begin|>"
+            '{"name": "search", "arguments": {"query": "Paris weather"}}'
+            "<|tool▁call▁end|>"
+        )
+        result = parse_tool_calls(text)
+        assert result is not None
+        assert [_call_name(tc) for tc in result] == ["get_weather", "search"]
+
     def test_simple_tool_call_tags(self):
         """<tool_call>...</tool_call> format."""
         text = '<tool_call>{"name": "get_weather", "arguments": {"city": "Guangzhou"}}</tool_call>'
@@ -329,6 +359,28 @@ class TestJSONRepair:
     def test_repair_json_returns_none_for_unrecoverable(self):
         assert _repair_json("not json at all !!!") is None
 
+    def test_repair_deep_missing_brackets(self):
+        """Repair missing closing delimiters for nested objects/arrays at EOF."""
+        broken = '[{"name": "get_weather", "arguments": {"city": "Lima"}'
+        repaired = _repair_json(broken)
+        assert repaired is not None
+        parsed = json.loads(repaired)
+        assert parsed == [{"name": "get_weather", "arguments": {"city": "Lima"}}]
+
+    def test_repair_nested_array_and_object_missing_closers(self):
+        broken = '[{"name": "search", "arguments": {"filters": [{"q": "python"}]'
+        repaired = _repair_json(broken)
+        assert repaired is not None
+        parsed = json.loads(repaired)
+        assert parsed[0]["arguments"]["filters"] == [{"q": "python"}]
+
+    def test_repair_single_object_missing_closers(self):
+        text = '<tool_calls>{"name": "get_weather", "arguments": {"city": "Lima"}</tool_calls>'
+        result = parse_tool_calls(text)
+        assert result is not None
+        assert _call_name(result[0]) == "get_weather"
+        assert _call_args(result[0]) == {"city": "Lima"}
+
     def test_strip_code_fences(self):
         text = "before\n```json\nsome code\n```\nafter"
         stripped = _strip_code_fences(text)
@@ -344,7 +396,6 @@ class TestJSONRepair:
 class TestDSFreeAPIRepairScenarios:
     """
     Mirrors the 10 known abnormal-format classes from ds-free-api repair scenarios.
-    Classes that cannot yet be supported are marked with TODO comments.
     """
 
     def test_r01_invalid_backslash_in_string(self):
@@ -424,18 +475,13 @@ class TestDSFreeAPIRepairScenarios:
 
     def test_r10_missing_closing_array_bracket(self):
         """
-        R10: Missing closing ] in the array.
-        TODO: Full bracket repair for deeply nested structures not yet supported.
-        The current implementation handles simple cases via rfind(']').
+        R10: Missing closing delimiters in the array.
         """
-        # Partially recoverable: the array close was just missed at the end
-        text = '<tool_calls>[{"name": "get_weather", "arguments": {"city": "Lima"}}]</tool_calls>'
+        text = '<tool_calls>[{"name": "get_weather", "arguments": {"city": "Lima"}}</tool_calls>'
         result = parse_tool_calls(text)
-        assert result is not None  # baseline — proper array
-        # True missing-bracket case — currently not supported, marked TODO
-        # text_broken = '<tool_calls>[{"name": "get_weather", "arguments": {"city": "Lima"}}</tool_calls>'
-        # result_broken = parse_tool_calls(text_broken)
-        # assert result_broken is not None  # TODO: not yet supported
+        assert result is not None
+        assert _call_name(result[0]) == "get_weather"
+        assert _call_args(result[0]) == {"city": "Lima"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -523,6 +569,44 @@ class TestEnforceToolChoice:
         assert result is not None
         assert len(result) == 1
         assert result[0]["function"]["name"] == "get_weather"
+
+    def test_allowed_tools_filters_to_allowed_subset(self):
+        tcs = self._make_tool_calls(["get_weather", "search"])
+        tool_choice = {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "auto",
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+            },
+        }
+        result, err = enforce_tool_choice(tcs, tool_choice, TOOLS_FIXTURE, True)
+        assert err is None
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "search"
+
+    def test_allowed_tools_required_returns_error_when_no_allowed_call(self):
+        tcs = self._make_tool_calls(["get_weather"])
+        tool_choice = {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "required",
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+            },
+        }
+        result, err = enforce_tool_choice(tcs, tool_choice, TOOLS_FIXTURE, True)
+        assert result is None
+        assert err is not None
+        assert "allowed" in err
+
+    def test_custom_tool_choice_filters_correctly(self):
+        tcs = self._make_tool_calls(["code_exec", "get_weather"])
+        tool_choice = {"type": "custom", "custom": {"name": "code_exec"}}
+        result, err = enforce_tool_choice(tcs, tool_choice, CUSTOM_TOOLS_FIXTURE, True)
+        assert err is None
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "code_exec"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -703,6 +787,31 @@ class TestToolsSystemMessage:
             tool_choice={"type": "function", "function": {"name": "get_weather"}},
         )
         assert "get_weather" in msg["content"]
+        assert "必须调用" in msg["content"]
+
+    def test_allowed_tools_instruction(self):
+        msg = tools_system_message(
+            TOOLS_FIXTURE,
+            tool_choice={
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "required",
+                    "tools": [{"type": "function", "function": {"name": "search"}}],
+                },
+            },
+        )
+        assert "只能从以下允许的工具中选择" in msg["content"]
+        assert "search" in msg["content"]
+        assert "必须调用" in msg["content"]
+
+    def test_custom_tool_definition_and_choice_instruction(self):
+        msg = tools_system_message(
+            CUSTOM_TOOLS_FIXTURE,
+            tool_choice={"type": "custom", "custom": {"name": "code_exec"}},
+        )
+        assert "code_exec" in msg["content"]
+        assert "custom" in msg["content"]
+        assert "grammar" in msg["content"]
         assert "必须调用" in msg["content"]
 
     def test_parallel_false_adds_rule(self):

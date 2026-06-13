@@ -4,10 +4,10 @@ Tool calling adapter for chatgpt2api.
 Design reference: ds-free-api (Rust, for DeepSeek)
   - Separate format-block / defs-text / instruction-text, mirroring ds-free-api's ToolContext
   - Dynamic examples built from actual tool names in the request
-  - tool_choice variants handled explicitly (auto / required / named)
+  - tool_choice variants handled explicitly (auto / required / named / allowed_tools / custom)
   - parallel_tool_calls: false support
   - Consistent format between system-prompt injection and history normalisation
-  - JSON repair (invalid backslashes, bare unquoted keys, missing brackets)
+  - JSON repair (invalid backslashes, bare unquoted keys, missing closing brackets)
   - Multi-tag parser: <tool_calls>, ds-free-api DeepSeek tokens, <invoke>, bare JSON
 
 Key difference vs ds-free-api: DeepSeek has native trained tokens; GPT-4 via the
@@ -48,6 +48,43 @@ _EXAMPLE_ARGS: dict[str, dict[str, Any]] = {
 _NESTED_EXAMPLE_ARGS: dict[str, Any] = {
     "config": {"enabled": True, "items": ["a", "b"]}
 }
+
+
+def _tool_name(tool: dict[str, Any]) -> str | None:
+    if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+        name = tool["function"].get("name")
+        return str(name) if name else None
+    if tool.get("type") == "custom" and isinstance(tool.get("custom"), dict):
+        name = tool["custom"].get("name")
+        return str(name) if name else None
+    return None
+
+
+def _tool_names(tools: list[dict[str, Any]]) -> list[str]:
+    return [name for tool in tools if (name := _tool_name(tool))]
+
+
+def _allowed_tool_names(allowed_tools: Any) -> list[str]:
+    if not isinstance(allowed_tools, dict):
+        return []
+    raw_tools = allowed_tools.get("tools")
+    if not isinstance(raw_tools, list):
+        return []
+    names: list[str] = []
+    for item in raw_tools:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function":
+            fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+            name = fn.get("name")
+        elif item.get("type") == "custom":
+            custom = item.get("custom") if isinstance(item.get("custom"), dict) else {}
+            name = custom.get("name")
+        else:
+            name = None
+        if name:
+            names.append(str(name))
+    return names
 
 
 def _example_args_for(name: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -115,38 +152,44 @@ def _build_format_block(tools: list[dict[str, Any]], parallel: bool = True) -> s
 
     lines.append("")
 
-    funcs = [t["function"] for t in tools if t.get("type") == "function" and "function" in t]
+    tool_names = _tool_names(tools)
 
-    if funcs:
+    if tool_names:
         lines.append("**正确示例：**")
         lines.append("")
 
-        a = funcs[0]
-        a_args = _example_args_for(a["name"], a)
+        a_name = tool_names[0]
+        a_tool = next((t for t in tools if _tool_name(t) == a_name), {})
+        a_schema = a_tool.get("function") if isinstance(a_tool.get("function"), dict) else {}
+        a_args = _example_args_for(a_name, a_schema)
         lines.append("**示例A** — 调用单个工具：")
-        lines.append(_tool_call_line(a["name"], a_args))
+        lines.append(_tool_call_line(a_name, a_args))
         lines.append("")
 
-        if len(funcs) >= 2 and parallel:
-            b = funcs[1]
-            b_args = _example_args_for(b["name"], b)
+        if len(tool_names) >= 2 and parallel:
+            b_name = tool_names[1]
+            b_tool = next((t for t in tools if _tool_name(t) == b_name), {})
+            b_schema = b_tool.get("function") if isinstance(b_tool.get("function"), dict) else {}
+            b_args = _example_args_for(b_name, b_schema)
             items_ab = ", ".join([
-                f'{{"name": "{a["name"]}", "arguments": {json.dumps(a_args, ensure_ascii=False)}}}',
-                f'{{"name": "{b["name"]}", "arguments": {json.dumps(b_args, ensure_ascii=False)}}}',
+                f'{{"name": "{a_name}", "arguments": {json.dumps(a_args, ensure_ascii=False)}}}',
+                f'{{"name": "{b_name}", "arguments": {json.dumps(b_args, ensure_ascii=False)}}}',
             ])
             lines.append("**示例B** — 同时调用两个工具（一个数组包含全部调用）：")
             lines.append(f"{TOOL_CALL_START}[{items_ab}]{TOOL_CALL_END}")
             lines.append("")
 
-        if len(funcs) >= 3 and parallel:
-            c = funcs[2]
-            c_args = _example_args_for(c["name"], c)
-            a_args2 = _example_args_for(a["name"], a)
-            b_args2 = _example_args_for(b["name"], b)  # type: ignore[possibly-undefined]
+        if len(tool_names) >= 3 and parallel:
+            c_name = tool_names[2]
+            c_tool = next((t for t in tools if _tool_name(t) == c_name), {})
+            c_schema = c_tool.get("function") if isinstance(c_tool.get("function"), dict) else {}
+            c_args = _example_args_for(c_name, c_schema)
+            a_args2 = _example_args_for(a_name, a_schema)
+            b_args2 = _example_args_for(b_name, b_schema)  # type: ignore[possibly-undefined]
             items_abc = ", ".join([
-                f'{{"name": "{a["name"]}", "arguments": {json.dumps(a_args2, ensure_ascii=False)}}}',
-                f'{{"name": "{b["name"]}", "arguments": {json.dumps(b_args2, ensure_ascii=False)}}}',  # type: ignore[possibly-undefined]
-                f'{{"name": "{c["name"]}", "arguments": {json.dumps(c_args, ensure_ascii=False)}}}',
+                f'{{"name": "{a_name}", "arguments": {json.dumps(a_args2, ensure_ascii=False)}}}',
+                f'{{"name": "{b_name}", "arguments": {json.dumps(b_args2, ensure_ascii=False)}}}',  # type: ignore[possibly-undefined]
+                f'{{"name": "{c_name}", "arguments": {json.dumps(c_args, ensure_ascii=False)}}}',
             ])
             lines.append("**示例C** — 同时调用三个工具（并行调用）：")
             lines.append(f"{TOOL_CALL_START}[{items_abc}]{TOOL_CALL_END}")
@@ -155,7 +198,7 @@ def _build_format_block(tools: list[dict[str, Any]], parallel: bool = True) -> s
         # Nested params example
         lines.append("**示例D** — 含嵌套参数：")
         lines.append(
-            f'{TOOL_CALL_START}[{{"name": "{a["name"]}", "arguments": '
+            f'{TOOL_CALL_START}[{{"name": "{a_name}", "arguments": '
             f'{json.dumps(_NESTED_EXAMPLE_ARGS, ensure_ascii=False)}}}]{TOOL_CALL_END}'
         )
         lines.append("")
@@ -167,21 +210,40 @@ def _build_defs_text(tools: list[dict[str, Any]]) -> str:
     """Format tool definitions for injection into the system prompt."""
     lines = ["你可以使用以下工具："]
     for t in tools:
-        if t.get("type") != "function":
+        if t.get("type") == "function" and isinstance(t.get("function"), dict):
+            fn = t.get("function", {})
+            name = fn.get("name", "")
+            desc = (fn.get("description") or "").strip()
+            params = json.dumps(fn.get("parameters", {}), ensure_ascii=False)
+            example_args = _example_args_for(name, fn)
+            call_ex = _tool_call_line(name, example_args)
+            desc_block = f"~~~markdown\n  {desc}\n~~~\n" if desc else "  无描述\n"
+            lines.append(
+                f"- **{name}** (function):\n"
+                f"  - 调用方法: `{call_ex}`\n"
+                f"  - 参数 schema: {params}\n"
+                f"  - 说明:\n{desc_block}"
+            )
             continue
-        fn = t.get("function", {})
-        name = fn.get("name", "")
-        desc = (fn.get("description") or "").strip()
-        params = json.dumps(fn.get("parameters", {}), ensure_ascii=False)
-        example_args = _example_args_for(name, fn)
-        call_ex = _tool_call_line(name, example_args)
-        desc_block = f"~~~markdown\n  {desc}\n~~~\n" if desc else "  无描述\n"
-        lines.append(
-            f"- **{name}** (function):\n"
-            f"  - 调用方法: `{call_ex}`\n"
-            f"  - 参数 schema: {params}\n"
-            f"  - 说明:\n{desc_block}"
-        )
+        if t.get("type") == "custom" and isinstance(t.get("custom"), dict):
+            custom = t.get("custom", {})
+            name = str(custom.get("name") or "")
+            desc = str(custom.get("description") or "").strip()
+            fmt = custom.get("format")
+            method = "无约束"
+            if isinstance(fmt, dict):
+                if fmt.get("type") == "text":
+                    method = "text"
+                elif fmt.get("type") == "grammar":
+                    grammar = fmt.get("grammar") if isinstance(fmt.get("grammar"), dict) else {}
+                    syntax = grammar.get("syntax") or "unknown"
+                    method = f"grammar(syntax: {syntax})"
+            desc_text = desc or "无描述"
+            lines.append(
+                f"- **{name}** (custom):\n"
+                f"  - 调用方法: `{method}`\n"
+                f"  - 简要说明: {desc_text}"
+            )
     return "\n".join(lines)
 
 
@@ -202,10 +264,23 @@ def _build_instruction_text(
 
     if isinstance(tool_choice, dict):
         t = tool_choice.get("type")
+        if t == "allowed_tools":
+            allowed = tool_choice.get("allowed_tools") or {}
+            allowed_names = _allowed_tool_names(allowed)
+            lines: list[str] = []
+            if allowed_names:
+                lines.append(f"**注意：**你只能从以下允许的工具中选择：{', '.join(allowed_names)}。")
+            if isinstance(allowed, dict) and allowed.get("mode") == "required":
+                lines.append("**注意：你必须调用一个或多个工具，不能直接回答。**")
+            return "\n".join(lines) if lines else None
         if t == "function":
             fn_name = (tool_choice.get("function") or {}).get("name", "")
             if fn_name:
                 return f"**注意：你必须调用 '{fn_name}' 工具，不能调用其他工具，也不能直接回答。**"
+        if t == "custom":
+            custom_name = (tool_choice.get("custom") or {}).get("name", "")
+            if custom_name:
+                return f"**注意：你必须调用 '{custom_name}' 自定义工具，不能调用其他工具，也不能直接回答。**"
     return None
 
 
@@ -279,6 +354,39 @@ def _repair_missing_array_bracket(s: str) -> str:
     return s
 
 
+def _repair_missing_closing_delimiters(s: str) -> str | None:
+    """Append missing ]/} delimiters when the existing prefix is structurally valid."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+
+    for char in s:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            if not stack or stack[-1] != pairs[char]:
+                return None
+            stack.pop()
+
+    if in_string or escaped:
+        return None
+
+    closers = {"[": "]", "{": "}"}
+    return s + "".join(closers[opener] for opener in reversed(stack))
+
+
 def _repair_json(s: str) -> str | None:
     """Try progressively more aggressive repairs and return the first valid JSON string."""
     candidates = [s]
@@ -291,6 +399,11 @@ def _repair_json(s: str) -> str | None:
 
     step3 = _repair_unquoted_keys(s)
     candidates.append(step3)
+
+    for base in (s, step1, step2, step3):
+        balanced = _repair_missing_closing_delimiters(base)
+        if balanced is not None:
+            candidates.append(balanced)
 
     for candidate in candidates:
         try:
@@ -335,7 +448,7 @@ _DS_BEGIN_RE = re.compile(
 
 # 2b. DeepSeek individual call segment: <|tool_call_begin|>...<|tool_call_end|>
 _DS_CALL_RE = re.compile(
-    r"<[|｜]tool[▁_]call[▁_]begin[|｜](.*?)<[|｜]tool[▁_]call[▁_]end[|｜]>",
+    r"<[|｜]tool[▁_]call[▁_]begin[|｜]>\s*(.*?)\s*<[|｜]tool[▁_]call[▁_]end[|｜]>",
     re.DOTALL,
 )
 
@@ -411,17 +524,27 @@ def _parse_json_array(raw: str) -> list[Any] | None:
     """Parse a JSON array (or bare object) with repair fallback."""
     raw = raw.strip()
 
-    # Handle bare single object: wrap in array
     if raw.startswith("{"):
+        obj_attempts = [raw, _repair_invalid_backslashes(raw)]
+        obj_repaired = _repair_json(raw)
+        if obj_repaired:
+            obj_attempts.append(obj_repaired)
+        for attempt in obj_attempts:
+            try:
+                obj = json.loads(attempt)
+                if isinstance(obj, dict):
+                    return [obj]
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Handle still-invalid bare single object by wrapping it in an array and
+        # falling through to the array repair path.
         raw = _repair_missing_array_bracket(raw)
 
     arr_start = raw.find("[")
     if arr_start == -1:
         return None
     arr_end = raw.rfind("]")
-    if arr_end == -1:
-        return None
-    json_str = raw[arr_start: arr_end + 1]
+    json_str = raw[arr_start: arr_end + 1] if arr_end != -1 else raw[arr_start:]
     if json_str.strip() == "[]":
         return None
 
@@ -530,11 +653,9 @@ def _parse_tool_calls_from(
     Core parser that operates on a single text string.
 
     When *fences* is provided, matches that are fully contained within a fence
-    region are deprioritised: the parser prefers outside-fence matches first,
-    only falling back to fenced ones if nothing else is found.  This lets a
-    ``<tool_calls>`` block whose *arguments* happen to contain triple-backtick
-    content (e.g. write_file with markdown) still be found and parsed correctly,
-    while fenced *example* blocks in the middle of prose are ignored.
+    region are ignored as documentation examples.  Matches that start or extend
+    outside a fence still count as real calls, which lets a ``<tool_calls>`` block
+    whose *arguments* contain triple-backtick content parse correctly.
     """
     _fences: list[tuple[int, int]] = fences if fences is not None else []
 
@@ -656,9 +777,8 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
       Patterns prefer matches that are NOT fully inside a code fence: this
       correctly handles tool calls whose *arguments* contain triple backticks
       (e.g. write_file with markdown) while still ignoring fenced *example*
-      blocks embedded in prose.  If no outside-fence match exists for a given
-      pattern, the fenced match is used as a last resort (handles the rare
-      model that wraps its entire tool-call block in a code fence).
+      blocks embedded in prose.  Matches fully contained in a fence are ignored
+      instead of being used as a fallback.
     """
     fences = _fence_regions(text)
     return _parse_tool_calls_from(text, fences=fences if fences else None)
@@ -680,18 +800,34 @@ def enforce_tool_choice(
         If error_message is set, the caller should surface it as a diagnostic error.
         filtered_tool_calls may be None (treat as normal text response).
     """
-    valid_names = {
-        t["function"]["name"]
-        for t in tools
-        if t.get("type") == "function" and "function" in t
-    }
+    valid_names = set(_tool_names(tools))
 
     # tool_choice: "required" — model MUST produce a tool call
     if tool_choice == "required" and not tool_calls:
         return None, (
-            "tool_choice is 'required' but the model did not produce a tool call. "
-            "The model returned a plain text response instead."
+            "tool_choice 'required' was set but model did not call any tool"
         )
+
+    if isinstance(tool_choice, dict) and not tool_calls:
+        choice_type = tool_choice.get("type")
+        if choice_type == "function":
+            required_name = (tool_choice.get("function") or {}).get("name", "")
+            if required_name:
+                return None, f"tool_choice specifies '{required_name}' but model did not call any tool."
+        if choice_type == "custom":
+            required_name = (tool_choice.get("custom") or {}).get("name", "")
+            if required_name:
+                return None, (
+                    f"tool_choice specifies custom tool '{required_name}' but model did not call any tool."
+                )
+        if choice_type == "allowed_tools":
+            allowed = tool_choice.get("allowed_tools") or {}
+            if isinstance(allowed, dict) and allowed.get("mode") == "required":
+                allowed_names = _allowed_tool_names(allowed)
+                return None, (
+                    f"tool_choice allowed_tools required one of {allowed_names} "
+                    "but model did not call any tool."
+                )
 
     if not tool_calls:
         return None, None
@@ -720,6 +856,33 @@ def enforce_tool_choice(
                 f"(called: {[tc['function']['name'] for tc in tool_calls]})."
             )
 
+    # tool_choice: named custom — only allow that specific custom tool
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "custom":
+        required_name = (tool_choice.get("custom") or {}).get("name", "")
+        if required_name:
+            named = [tc for tc in tool_calls if tc["function"]["name"] == required_name]
+            if named:
+                return named[:1], None
+            return None, (
+                f"tool_choice specifies custom tool '{required_name}' but model did not call that tool "
+                f"(called: {[tc['function']['name'] for tc in tool_calls]})."
+            )
+
+    # tool_choice: allowed_tools — allow a subset and optionally require one of them
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "allowed_tools":
+        allowed = tool_choice.get("allowed_tools") or {}
+        allowed_names = set(_allowed_tool_names(allowed))
+        if allowed_names:
+            allowed_calls = [tc for tc in tool_calls if tc["function"]["name"] in allowed_names]
+            if allowed_calls:
+                tool_calls = allowed_calls
+            elif isinstance(allowed, dict) and allowed.get("mode") == "required":
+                return None, (
+                    f"tool_choice allowed_tools required one of {sorted(allowed_names)} but model "
+                    f"called {[tc['function']['name'] for tc in tool_calls]}."
+                )
+            else:
+                return None, None
     # parallel_tool_calls: false — keep only first
     if not parallel_tool_calls and len(tool_calls) > 1:
         tool_calls = tool_calls[:1]

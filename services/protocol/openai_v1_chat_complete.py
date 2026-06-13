@@ -225,6 +225,20 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
+def _tool_choice_error(err: str, full_text: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "message": err,
+                "type": "tool_choice_error",
+                "code": "tool_choice_not_satisfied",
+                "raw_response": full_text,
+            }
+        },
+    )
+
+
 def _text_with_tools_response(
     model: str,
     messages: list[dict[str, Any]],
@@ -237,18 +251,7 @@ def _text_with_tools_response(
     tool_calls, err = enforce_tool_choice(raw_tool_calls, tool_choice, tools, parallel_tool_calls)
 
     if err:
-        # Return a diagnosable error response for tool_choice violations
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": {
-                    "message": err,
-                    "type": "tool_choice_error",
-                    "code": "tool_choice_not_satisfied",
-                    "raw_response": full_text,
-                }
-            },
-        )
+        raise _tool_choice_error(err, full_text)
 
     if tool_calls:
         return tool_calls_response(model, tool_calls, messages=messages, full_text=full_text)
@@ -266,28 +269,11 @@ def _text_with_tools_stream(
     raw_tool_calls = parse_tool_calls(full_text)
     tool_calls, err = enforce_tool_choice(raw_tool_calls, tool_choice, tools, parallel_tool_calls)
 
+    if err:
+        raise _tool_choice_error(err, full_text)
+
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-
-    if err:
-        # Emit a special error chunk then stop — clients can detect finish_reason="error"
-        yield {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant", "content": None},
-                "finish_reason": "error",
-            }],
-            "error": {
-                "message": err,
-                "type": "tool_choice_error",
-                "code": "tool_choice_not_satisfied",
-            },
-        }
-        return
 
     if tool_calls:
         # Calculate usage for the stream's final chunk

@@ -5,6 +5,8 @@ from unittest import mock
 import json
 import base64
 
+from fastapi import HTTPException
+
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import chat_completion_cache
@@ -16,6 +18,22 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP8z8BQDwAFgwJ/luzl4wAAAABJRU5ErkJggg=="
 )
 PNG_1X1_DATA_URL = "data:image/png;base64," + base64.b64encode(PNG_1X1).decode("ascii")
+
+
+TOOLS_FIXTURE = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather in a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
 
 
 class ChatCompletionCacheTests(unittest.TestCase):
@@ -142,6 +160,109 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(details["cached_tokens"], 0)
         output_details = response["usage"]["completion_tokens_details"]
         self.assertEqual(output_details["reasoning_tokens"], 0)
+
+    def test_tool_choice_violation_raises_422_non_stream(self) -> None:
+        raw_response = "I can answer directly without a tool."
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": TOOLS_FIXTURE,
+            "tool_choice": "required",
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value=raw_response),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                openai_v1_chat_complete.handle(body)
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(
+            raised.exception.detail,
+            {
+                "error": {
+                    "message": "tool_choice 'required' was set but model did not call any tool",
+                    "type": "tool_choice_error",
+                    "code": "tool_choice_not_satisfied",
+                    "raw_response": raw_response,
+                }
+            },
+        )
+
+    def test_tool_choice_violation_raises_422_stream(self) -> None:
+        raw_response = "I can answer directly without a tool."
+        body = {
+            "model": "auto",
+            "stream": True,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": TOOLS_FIXTURE,
+            "tool_choice": "required",
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value=raw_response),
+        ):
+            stream = openai_v1_chat_complete.handle(body)
+            with self.assertRaises(HTTPException) as raised:
+                list(stream)
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(
+            raised.exception.detail,
+            {
+                "error": {
+                    "message": "tool_choice 'required' was set but model did not call any tool",
+                    "type": "tool_choice_error",
+                    "code": "tool_choice_not_satisfied",
+                    "raw_response": raw_response,
+                }
+            },
+        )
+
+    def test_tool_choice_violation_stream_does_not_emit_error_chunk(self) -> None:
+        body = {
+            "model": "auto",
+            "stream": True,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": TOOLS_FIXTURE,
+            "tool_choice": "required",
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value="plain answer"),
+        ):
+            stream = openai_v1_chat_complete.handle(body)
+            with self.assertRaises(HTTPException):
+                next(stream)
+
+    def test_tool_choice_violation_stream_detail_matches_non_stream(self) -> None:
+        raw_response = "I can answer directly without a tool."
+
+        def body(stream: bool) -> dict:
+            return {
+                "model": "auto",
+                "stream": stream,
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": TOOLS_FIXTURE,
+                "tool_choice": "required",
+            }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value=raw_response),
+        ):
+            with self.assertRaises(HTTPException) as non_stream:
+                openai_v1_chat_complete.handle(body(stream=False))
+            stream = openai_v1_chat_complete.handle(body(stream=True))
+            with self.assertRaises(HTTPException) as streamed:
+                list(stream)
+
+        self.assertEqual(streamed.exception.status_code, non_stream.exception.status_code)
+        self.assertEqual(streamed.exception.detail, non_stream.exception.detail)
+        self.assertEqual(streamed.exception.detail["error"]["raw_response"], raw_response)
 
     def test_responses_completed_usage_includes_cached_tokens(self) -> None:
         with (

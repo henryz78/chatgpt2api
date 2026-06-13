@@ -15,7 +15,7 @@
 ### 3. 单轮工具调用（Single-Turn Tool Calling）
 - 新增 `services/protocol/tool_calling.py`
   - 工具定义转换为系统提示注入（无需修改上游 API 调用）
-  - 解析模型输出中的工具调用格式（支持 ` ```json ` 代码块、裸 JSON、旧版 XML 三种格式）
+  - 解析模型输出中的工具调用格式（支持裸 JSON、旧版 XML、DeepSeek token、invoke 等格式）
   - 将解析结果格式化为 OpenAI 标准的 `tool_calls` 结构
   - 支持流式（stream）和非流式两种响应
 - 修改 `services/protocol/openai_v1_chat_complete.py` 集成工具调用逻辑
@@ -49,11 +49,14 @@
   - 非法反斜杠修复
   - 未加引号的 key 修复
   - 裸对象自动包装为数组
+  - 尾部缺失 `]`/`}` 时自动补全
 
 ### 7. tool_choice 行为强化
 - `tool_choice: "none"` → 不注入工具提示（已有）
 - `tool_choice: "required"` → 模型未返回工具调用时返回 422 可诊断错误
 - `tool_choice: {"type":"function","function":{"name":"xxx"}}` → 过滤只保留指定工具调用；未调用时返回错误
+- `tool_choice: {"type":"allowed_tools",...}` → 限制允许工具集合，支持 `mode=auto/required`
+- `tool_choice: {"type":"custom","custom":{"name":"xxx"}}` → 支持 custom 工具选择约束
 - `parallel_tool_calls: false` → 多工具时只保留第一个
 - 未知工具名称过滤：不在 `request.tools` 中的工具自动过滤；全部未知则返回错误
 - 新增 `enforce_tool_choice()` 公开函数
@@ -63,7 +66,7 @@
 - 最后一个 chunk 的 `finish_reason` 保证为 `"tool_calls"`
 - 支持可选 `usage` 字段注入到最后一个 chunk
 - 无工具调用时正常返回文本流（分块 32 字符）
-- `tool_choice` 约束未满足时在流模式下也返回可诊断错误 chunk（`finish_reason: "error"`）
+- `tool_choice` 约束未满足时，stream 与 non-stream 一致抛出 HTTP 422 可诊断错误
 - stream + tools 测试覆盖已添加
 
 ### 9. Legacy 兼容（旧版 OpenAI function calling）
@@ -84,9 +87,9 @@
 - `tool_calls_response()` 新增 `messages` / `full_text` 可选参数用于 token 计算
 
 ### 11. Parser 单元测试（新增 `test/test_tool_calling.py`）
-- 覆盖 8 大测试类，~60 个测试用例：
+- 覆盖工具解析、repair、tool_choice、legacy、stream chunk 等核心路径：
   - 所有 tag 格式（canonical XML、DeepSeek、invoke、bare JSON、single object）
-  - JSON repair（非法反斜杠、未加引号 key、裸对象）
+  - JSON repair（非法反斜杠、未加引号 key、裸对象、尾部缺失括号）
   - 代码块误识别防护
   - 并行工具调用
   - `enforce_tool_choice` 全路径
@@ -94,7 +97,7 @@
   - `normalize_tool_history` 全路径（包括 legacy function_call）
   - `tools_system_message` 提示词内容验证
   - `stream_tool_calls_chunks` 结构验证 + arguments 可重建
-  - ds-free-api 10 类异常格式（能支持的 9/10 已支持，R10 缺失右括号 TODO）
+  - ds-free-api 10 类异常格式（含 R10 尾部缺失右括号修复）
 
 ---
 
@@ -116,7 +119,8 @@
 ```
 services/protocol/tool_calling.py           [大幅更新] 解析器增强 + legacy compat + enforce_tool_choice + usage
 services/protocol/openai_v1_chat_complete.py [更新] 集成 enforce_tool_choice + legacy compat + usage
-test/test_tool_calling.py                   [新增] 单元测试 (~60 用例)
+test/test_tool_calling.py                   [新增] parser/tool_choice/stream 单元测试
+test/test_chat_completion_cache.py          [更新] stream/non-stream 422 一致性回归测试
 PROGRESS.md                                 [本文件]
 ```
 
@@ -135,11 +139,13 @@ PROGRESS.md                                 [本文件]
 | `arguments` 是字符串时规范化 | ✅ 已对齐 | |
 | JSON repair：非法反斜杠 | ✅ 已对齐 | |
 | JSON repair：未加引号 key | ✅ 已对齐 | |
-| JSON repair：缺失数组括号 | ⚠️ 部分支持 | 尾部缺失 `]` 的简单情况，深度嵌套 TODO |
+| JSON repair：缺失右括号/右中括号 | ✅ 已对齐 | 支持尾部缺失 `]`/`}` 的嵌套补全 |
 | JSON repair：只有对象 | ✅ 已对齐 | 自动包装为数组 |
-| 代码块示例不误识别 | ✅ 已对齐 | strip_code_fences |
+| 代码块示例不误识别 | ✅ 已对齐 | fence-aware parser，忽略完整位于代码块内的示例 |
 | tool_choice: required 校验 | ✅ 已对齐 | 422 诊断错误 |
 | tool_choice: named 过滤 | ✅ 已对齐 | |
+| tool_choice: allowed_tools | ✅ 已对齐 | 支持允许集合过滤与 required |
+| tool_choice: custom | ✅ 已对齐 | 支持 custom 工具定义与选择约束 |
 | parallel_tool_calls: false | ✅ 已对齐 | |
 | 未知工具过滤 | ✅ 已对齐 | |
 | 流式滑动窗口 ToolCallStream | ❌ 未对齐 | 仍为 collect_text 后伪造，TODO 长期优化 |
@@ -150,14 +156,14 @@ PROGRESS.md                                 [本文件]
 
 1. **滑动窗口实时流式工具调用**（ds-free-api ToolCallStream）：当前依然是先 `collect_text` 收全量响应再伪造 stream chunks。真正的实时流需要在模型输出过程中检测 tool call 边界，复杂度较高，短期接受现状，长期 TODO。
 
-2. **缺失右括号的深度修复**（R10）：对于 `[{"name":"foo","arguments":{"a":"b"}` 这类尾部 `]` 和 `}` 都缺失的情况，当前 repair 无法处理。需要引入 tokenizer-level 修复（参考 ds-free-api 的 bracket balance 算法），TODO。
+2. **二次模型修复流**（ds-free-api RepairStream）：当前只做本地确定性 JSON repair，不会在工具解析失败时再发起一次修复模型调用。考虑到本项目走 ChatGPT Web 后端，二次修复会增加延迟和账号消耗，暂不实现。
 
 ---
 
 ## 下一步 / Next Steps
 
 - [ ] **实时流式工具调用**：参考 ds-free-api 滑动窗口，实现真正边解析边输出
-- [ ] **深度 JSON bracket repair**：处理多层缺失括号的情况
+- [ ] **二次模型修复流**：评估是否需要类似 ds-free-api RepairStream 的工具调用修复链路
 - [ ] **端到端集成测试**：用真实账号验证 stream + tools 在 OpenCat / Cursor 下的兼容性
 - [ ] **账号池负载均衡**：多账号轮换策略完善
 - [ ] **response_format: json_object**：JSON 模式支持
