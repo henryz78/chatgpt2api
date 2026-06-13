@@ -174,9 +174,7 @@ def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], li
     tools = _tool_calling_tools(body.get("tools"))
     tool_choice = body.get("tool_choice", "auto")
     parallel_tool_calls = body.get("parallel_tool_calls", True)
-    raw_body_messages = chat_messages_from_body(body)
-    if tools and tool_choice != "none":
-        raw_body_messages = normalize_tool_history(raw_body_messages)
+    raw_body_messages = normalize_tool_history(chat_messages_from_body(body))
     raw_messages = normalize_text_messages(normalize_messages(raw_body_messages))
     if tools and tool_choice != "none":
         raw_messages.insert(0, tools_system_message(
