@@ -1102,9 +1102,10 @@ class AccountService:
         # CPA/Codex 导出文件里的 `type=codex` 是导出格式，不是号池套餐类型。
         if str(payload.get("type") or "").strip().lower() == "codex":
             payload["export_type"] = "codex"
-            payload["source_type"] = "codex"
+            if not str(payload.get("source_type") or "").strip():
+                payload["source_type"] = "codex"
             payload.pop("type", None)
-        if str(payload.get("export_type") or "").strip().lower() == "codex":
+        if str(payload.get("export_type") or "").strip().lower() == "codex" and not str(payload.get("source_type") or "").strip():
             payload["source_type"] = "codex"
         if payload.get("plan_type") and not payload.get("type"):
             payload["type"] = str(payload.get("plan_type") or "").strip()
@@ -1619,7 +1620,7 @@ class AccountService:
             access_token = str(account.get("access_token") or "").strip()
             refresh_token = str(account.get("refresh_token") or "").strip()
             id_token = str(account.get("id_token") or "").strip()
-            if not access_token or not refresh_token or not id_token:
+            if not access_token or not refresh_token:
                 continue
 
             access_payload = self._decode_jwt_payload(access_token)
@@ -1645,10 +1646,17 @@ class AccountService:
                 "account_id": account_id,
                 "access_token": access_token,
                 "refresh_token": refresh_token,
-                "id_token": id_token,
                 "expired": self._timestamp_to_iso(access_payload.get("exp")),
                 "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
             }
+            if id_token:
+                item["id_token"] = id_token
+            source_type = str(account.get("source_type") or "").strip()
+            if source_type:
+                item["source_type"] = source_type
+            plan_type = str(account.get("type") or "").strip()
+            if plan_type:
+                item["plan_type"] = plan_type
             password = str(account.get("password") or "").strip()
             if password:
                 item["password"] = password

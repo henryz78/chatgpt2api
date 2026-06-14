@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
+  exportAccounts,
   fetchAccounts,
   fetchModels,
   fetchRefreshProgress,
@@ -162,10 +163,14 @@ function maskToken(token?: string) {
 function downloadTokens(accounts: Account[]) {
   const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
   const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  downloadBlob(blob, `account-access-tokens-${Date.now()}.txt`);
+}
+
+function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `accounts-${Date.now()}.txt`;
+  link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -206,6 +211,7 @@ function AccountsPageContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
+  const [isExportingFull, setIsExportingFull] = useState(false);
   const [progress, setProgress] = useState<{
     visible: boolean;
     current: number;
@@ -312,6 +318,32 @@ function AccountsPageContent() {
   const abnormalTokens = useMemo(() => {
     return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
   }, [accounts]);
+
+  const handleExportFullAccounts = async () => {
+    const confirmed = window.confirm(
+      "完整账号 JSON 会包含 refresh_token，可用于长期续期；如果账号里有 id_token 也会一起保留。请只在备份或迁移时导出，并妥善保存文件。确认继续导出吗？",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsExportingFull(true);
+    try {
+      const { blob, filename, count } = await exportAccounts([], "json");
+      downloadBlob(blob, filename);
+      const skipped = typeof count === "number" ? Math.max(0, accounts.length - count) : 0;
+      toast.success(
+        `完整账号 JSON 已开始下载，共 ${count ?? accounts.length} 个账号${
+          skipped > 0 ? `，跳过 ${skipped} 个缺少完整凭据的账号` : ""
+        }`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "完整账号导出失败";
+      toast.error(message);
+    } finally {
+      setIsExportingFull(false);
+    }
+  };
 
   const paginationItems = useMemo(() => {
     const items: (number | "...")[] = [];
@@ -779,7 +811,17 @@ function AccountsPageContent() {
             disabled={accounts.length === 0}
           >
             <Download className="size-4" />
-            导出全部 Token
+            导出 AT TXT
+          </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => void handleExportFullAccounts()}
+            disabled={accounts.length === 0 || isExportingFull}
+            title="导出 access_token 和 refresh_token，用于可续期账号备份"
+          >
+            {isExportingFull ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+            导出完整 JSON
           </Button>
         </div>
       </section>

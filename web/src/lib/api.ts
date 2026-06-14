@@ -383,11 +383,50 @@ export async function fetchModels() {
   return httpRequest<ModelListResponse>("/v1/models");
 }
 
+function filenameFromDisposition(disposition: unknown) {
+  if (typeof disposition !== "string" || !disposition) {
+    return null;
+  }
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1].replace(/^"|"$/g, ""));
+  }
+  const fallbackMatch = disposition.match(/filename="?([^";]+)"?/i);
+  return fallbackMatch?.[1] ?? null;
+}
+
 export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "POST",
     body: { tokens, accounts },
   });
+}
+
+export async function exportAccounts(accessTokens: string[] = [], format: "json" | "zip" = "json") {
+  if (format === "json") {
+    const payload = await httpRequest<unknown>("/api/accounts/export", {
+      method: "POST",
+      body: { access_tokens: accessTokens, format },
+    });
+    const count = Array.isArray(payload) ? payload.length : payload && typeof payload === "object" ? 1 : 0;
+    return {
+      blob: new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json;charset=utf-8" }),
+      filename: `codex-accounts-${Date.now()}.json`,
+      count,
+    };
+  }
+
+  const response = await request.post(
+    "/api/accounts/export",
+    { access_tokens: accessTokens, format },
+    { responseType: "blob" },
+  );
+  return {
+    blob: response.data as Blob,
+    filename:
+      filenameFromDisposition(response.headers["content-disposition"]) ?? `codex-accounts-${Date.now()}.${format}`,
+    count: null,
+  };
 }
 
 export type OAuthLoginStartResponse = {

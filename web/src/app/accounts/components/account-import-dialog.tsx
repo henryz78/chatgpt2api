@@ -101,17 +101,38 @@ function getCodexAuthAccount(value: unknown): AccountImportPayload | null {
     return null;
   }
 
+  const sourceType = typeof raw.source_type === "string" ? raw.source_type.trim() : "";
   const payload: AccountImportPayload = {
     ...raw,
     access_token: token,
     export_type: "codex",
-    source_type: "codex",
+    source_type: sourceType || "codex",
   };
   delete payload.accessToken;
   if (payload.type === "codex") {
     delete payload.type;
   }
   return payload;
+}
+
+function getCodexAuthAccounts(value: unknown) {
+  const container =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as { accounts?: unknown; data?: unknown; items?: unknown })
+      : null;
+  const rawItems = Array.isArray(value)
+    ? value
+    : Array.isArray(container?.items)
+      ? container.items
+      : Array.isArray(container?.accounts)
+        ? container.accounts
+        : Array.isArray(container?.data)
+          ? container.data
+          : [value];
+
+  return rawItems
+    .map((item) => getCodexAuthAccount(item))
+    .filter((item): item is AccountImportPayload => Boolean(item));
 }
 
 function readFileAsText(file: File) {
@@ -171,6 +192,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [oauthStarting, setOauthStarting] = useState(false);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
+  const codexJsonInputRef = useRef<HTMLInputElement | null>(null);
   const cpaInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetState = () => {
@@ -184,6 +206,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setOauthSession(null);
     setOauthCallbackInput("");
     setOauthStarting(false);
+    if (codexJsonInputRef.current) {
+      codexJsonInputRef.current.value = "";
+    }
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -355,22 +380,52 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const handleImportCodexAuthJson = async () => {
     if (!codexAuthInput.trim()) {
-      toast.error("请先粘贴 Codex 认证 JSON");
+      toast.error("请先粘贴完整账号 JSON");
       return;
     }
 
     try {
       const payload = JSON.parse(codexAuthInput) as unknown;
-      const account = getCodexAuthAccount(payload);
+      const accounts = getCodexAuthAccounts(payload);
 
-      if (!account) {
-        toast.error("未从 Codex 认证 JSON 中提取到 access_token");
+      if (accounts.length === 0) {
+        toast.error("未从完整账号 JSON 中提取到 access_token");
         return;
       }
 
-      await submitTokens([account.access_token], "Codex 认证 JSON 导入完成", [account]);
+      await submitTokens(
+        accounts.map((account) => account.access_token),
+        "完整账号 JSON 导入完成",
+        accounts,
+      );
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Codex 认证 JSON 解析失败";
+      const message = error instanceof Error ? error.message : "完整账号 JSON 解析失败";
+      toast.error(message);
+    }
+  };
+
+  const handleCodexJsonSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    try {
+      const content = await readFileAsText(file);
+      const payload = JSON.parse(content) as unknown;
+      const accounts = getCodexAuthAccounts(payload);
+
+      if (accounts.length === 0) {
+        toast.error("JSON 文件里没有读取到完整账号");
+        return;
+      }
+
+      setCodexAuthInput(content);
+      toast.success(`已从 ${file.name} 读取 ${accounts.length} 个完整账号`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取完整账号 JSON 失败";
       toast.error(message);
     }
   };
@@ -673,15 +728,43 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             <ArrowLeft className="size-4" />
             返回导入方式
           </button>
+          <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600">
+            支持粘贴单个账号对象、账号数组，或选择从"导出完整 JSON"下载的文件。包含 refresh_token 的账号导入后可继续自动续期。
+          </div>
           <div className="space-y-2">
-            <label className="text-sm font-medium text-stone-700">Codex 认证 JSON</label>
+            <label className="text-sm font-medium text-stone-700">完整账号 JSON</label>
             <Textarea
-              placeholder='粘贴包含 "access_token"、"refresh_token"、"id_token" 的 Codex 认证 JSON...'
+              placeholder='粘贴包含 "access_token"、"refresh_token" 的 JSON；有 "id_token" 也会保留，支持账号数组...'
               value={codexAuthInput}
               onChange={(event) => setCodexAuthInput(event.target.value)}
               className="min-h-64 resize-none rounded-xl border-stone-200 font-mono text-xs"
             />
           </div>
+          <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1">
+                <div className="text-sm font-medium text-stone-800">从 JSON 文件导入</div>
+                <div className="text-sm leading-6 text-stone-500">适合导入完整账号备份，保留 refresh_token 和 id_token 等字段。</div>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                className="rounded-xl border-stone-200 bg-white"
+                onClick={() => codexJsonInputRef.current?.click()}
+                disabled={isSubmitting}
+              >
+                <FileJson className="size-4" />
+                选择 JSON
+              </Button>
+            </div>
+          </div>
+          <input
+            ref={codexJsonInputRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(event) => void handleCodexJsonSelected(event)}
+          />
         </div>
       );
     }
@@ -707,8 +790,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           onClick={() => setMethod("session")}
         />
         <MethodCard
-          title="导入 Codex 认证 JSON"
-          description="粘贴 Codex 认证 JSON，导入后账号来源标记为 codex。"
+          title="导入完整账号 JSON"
+          description="支持粘贴或选择 JSON 文件，保留 refresh_token 和 id_token 用于自动续期。"
           icon={FileJson}
           onClick={() => setMethod("codex-auth")}
         />
@@ -765,7 +848,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   : method === "session"
                     ? "导入 Session JSON"
                     : method === "codex-auth"
-                      ? "导入 Codex 认证 JSON"
+                      ? "导入完整账号 JSON"
                     : method === "oauth"
                       ? "OAuth 登录已有账号"
                       : "导入 CPA JSON"}
@@ -778,7 +861,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   : method === "session"
                     ? "粘贴完整 Session JSON，系统会自动提取 accessToken。"
                     : method === "codex-auth"
-                      ? "粘贴 Codex 认证 JSON，系统会按 codex 来源导入。"
+                      ? "粘贴或选择完整账号 JSON，系统会保留可续期凭据。"
                     : method === "oauth"
                       ? "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
                       : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}

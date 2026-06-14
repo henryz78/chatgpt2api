@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.5.2 - 2026-06-14
+
++ [新增] 号池管理新增完整账号 JSON 导出，保留 `refresh_token` 等可续期凭据用于迁移备份。
++ [新增] 导入面板支持完整账号 JSON 粘贴和文件导入，兼容单对象、数组和常见包裹格式。
++ [优化] Access Token TXT 导出与完整账号导出分开命名，避免误把短期 AT 当作可续期备份。
+
 ## 1.5.1 - 2026-06-14
 
 + [新增] Chat Completions 工具调用兼容增强，支持多轮工具历史、流式工具调用、legacy functions/function_call、`tool_choice` 约束和多种工具调用格式解析。

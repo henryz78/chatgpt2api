@@ -311,7 +311,7 @@ def create_router() -> APIRouter:
         if not items:
             raise HTTPException(
                 status_code=400,
-                detail={"error": "没有可导出的完整账号，需要同时有 access_token、refresh_token 和 id_token"},
+                detail={"error": "没有可导出的可续期账号，需要至少有 access_token 和 refresh_token"},
             )
 
         timestamp = _download_timestamp()
