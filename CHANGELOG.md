@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.5.1 - 2026-06-14
+
++ [新增] Chat Completions 工具调用兼容增强，支持多轮工具历史、流式工具调用、legacy functions/function_call、`tool_choice` 约束和多种工具调用格式解析。
++ [新增] 发布版本时自动构建并推送 GHCR Docker 镜像，支持 `linux/amd64` 与 `linux/arm64`。
++ [优化] 默认 Docker Compose 镜像切换为本仓库 GHCR 镜像，并支持通过 `CHATGPT2API_IMAGE` 覆盖。
++ [修复] 多轮工具调用 Turn2 省略 `tools` 时的历史规范化问题。
+
 ## 1.5.0 - 2026-06-13
 
 + [新增] 新增 WARP / Privoxy / FlareSolverr 清障方案，注册遇到 Cloudflare 拦截后可刷新 clearance 并重试。
