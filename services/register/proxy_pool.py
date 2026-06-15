@@ -151,8 +151,11 @@ class RegisterProxyPool:
         if mode == "url":
             self.refresh_url(force=True)
         state = self.state()
+        if state.mode == "url" and state.last_error:
+            raise RuntimeError(state.last_error)
         if state.mode in {"url", "text"} and state.count == 0:
             message = state.last_error or f"no proxies available for {state.mode} proxy source"
+            self._record_error(message)
             raise RuntimeError(message)
         return state
 

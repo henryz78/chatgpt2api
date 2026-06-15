@@ -19,7 +19,7 @@ from curl_cffi import requests
 from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
-from services.register.proxy_pool import RegisterProxyPool
+from services.register.proxy_pool import RegisterProxyPool, normalize_proxy_input_mode
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -653,6 +653,25 @@ class PlatformRegistrar:
         }
 
 
+def _sync_proxy_pool_stats(state) -> None:
+    with stats_lock:
+        stats["current_proxy"] = state.current_proxy
+        stats["proxy_pool_count"] = state.count
+        stats["proxy_source"] = state.source
+        stats["proxy_pool_last_error"] = state.last_error
+        stats["proxy_pool_last_fetch"] = state.last_fetch
+
+
+def _proxy_pool_stats_payload(state) -> dict[str, object]:
+    return {
+        "current_proxy": state.current_proxy,
+        "proxy_pool_count": state.count,
+        "proxy_source": state.source,
+        "proxy_pool_last_error": state.last_error,
+        "proxy_pool_last_fetch": state.last_fetch,
+    }
+
+
 def configure_proxy_pool(fetch_now: bool = False) -> dict[str, object]:
     """Re-configure the global proxy pool from the current register config."""
     try:
@@ -667,34 +686,20 @@ def configure_proxy_pool(fetch_now: bool = False) -> dict[str, object]:
         refresh_interval=refresh_interval,
         fetch_now=fetch_now,
     )
-    with stats_lock:
-        stats["proxy_pool_count"] = state.count
-        stats["proxy_source"] = state.source
-        stats["proxy_pool_last_error"] = state.last_error
-        stats["proxy_pool_last_fetch"] = state.last_fetch
-    return {
-        "proxy_pool_count": state.count,
-        "proxy_source": state.source,
-        "proxy_pool_last_error": state.last_error,
-        "proxy_pool_last_fetch": state.last_fetch,
-    }
+    _sync_proxy_pool_stats(state)
+    return _proxy_pool_stats_payload(state)
 
 
 def prepare_proxy_pool() -> dict[str, object]:
     """Pre-flight: ensure the proxy pool is ready (fetch URL proxies etc.)."""
-    state = proxy_pool.prepare()
-    with stats_lock:
-        stats["current_proxy"] = state.current_proxy
-        stats["proxy_pool_count"] = state.count
-        stats["proxy_source"] = state.source
-        stats["proxy_pool_last_error"] = state.last_error
-        stats["proxy_pool_last_fetch"] = state.last_fetch
-    return {
-        "proxy_pool_count": state.count,
-        "proxy_source": state.source,
-        "proxy_pool_last_error": state.last_error,
-        "proxy_pool_last_fetch": state.last_fetch,
-    }
+    try:
+        state = proxy_pool.prepare()
+    except RuntimeError:
+        state = proxy_pool.state()
+        _sync_proxy_pool_stats(state)
+        raise
+    _sync_proxy_pool_stats(state)
+    return _proxy_pool_stats_payload(state)
 
 
 def worker(index: int) -> dict:
@@ -706,8 +711,11 @@ def worker(index: int) -> dict:
         stats["proxy_source"] = selection.source
         stats["proxy_pool_last_error"] = selection.last_error
         stats["proxy_pool_last_fetch"] = selection.last_fetch
-    if str(config.get("proxy_input_mode") or "single") in {"url", "text"} and not selection.proxy:
+    if normalize_proxy_input_mode(config.get("proxy_input_mode")) in {"url", "text"} and not selection.proxy:
         step(index, selection.last_error or "No proxy available, skipping", "yellow")
+        with stats_lock:
+            stats["done"] += 1
+            stats["fail"] += 1
         return {"ok": False, "index": index, "error": selection.last_error or "no_proxy"}
     registrar = PlatformRegistrar(selection.proxy)
     try:

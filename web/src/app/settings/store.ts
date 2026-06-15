@@ -251,6 +251,48 @@ function normalizeFiles(items: CPARemoteFile[]) {
   return files;
 }
 
+function buildRegisterPayload(registerConfig: RegisterConfig): Partial<RegisterConfig> {
+  return {
+    mail: {
+      ...registerConfig.mail,
+      api_use_register_proxy: registerConfig.mail.api_use_register_proxy !== false,
+    },
+    proxy: registerConfig.proxy.trim(),
+    proxy_input_mode: registerConfig.proxy_input_mode || "single",
+    proxy_url: registerConfig.proxy_url.trim(),
+    proxy_list_text: registerConfig.proxy_list_text,
+    proxy_refresh_interval: Math.max(10, Number(registerConfig.proxy_refresh_interval) || 120),
+    total: Math.max(1, Number(registerConfig.total) || 1),
+    threads: Math.max(1, Number(registerConfig.threads) || 1),
+    mode: registerConfig.mode,
+    target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
+    target_available: Math.max(1, Number(registerConfig.target_available) || 1),
+    check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+  };
+}
+
+function normalizeRegisterConfig(config: RegisterConfig): RegisterConfig {
+  const mail = config.mail || {
+    request_timeout: 30,
+    wait_timeout: 30,
+    wait_interval: 2,
+    api_use_register_proxy: true,
+    providers: [],
+  };
+  return {
+    ...config,
+    proxy_input_mode: config.proxy_input_mode || "single",
+    proxy_url: config.proxy_url || "",
+    proxy_list_text: config.proxy_list_text || "",
+    proxy_refresh_interval: Number(config.proxy_refresh_interval || 120),
+    mail: {
+      ...mail,
+      providers: Array.isArray(mail.providers) ? mail.providers : [],
+      api_use_register_proxy: mail.api_use_register_proxy !== false,
+    },
+  };
+}
+
 type SettingsStore = {
   config: SettingsConfig | null;
   isLoadingConfig: boolean;
@@ -327,6 +369,10 @@ type SettingsStore = {
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
   setRegisterProxy: (value: string) => void;
+  setRegisterProxyInputMode: (value: RegisterConfig["proxy_input_mode"]) => void;
+  setRegisterProxyUrl: (value: string) => void;
+  setRegisterProxyListText: (value: string) => void;
+  setRegisterProxyRefreshInterval: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterMode: (value: "total" | "quota" | "available") => void;
@@ -334,6 +380,7 @@ type SettingsStore = {
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
+  setRegisterMailApiUseRegisterProxy: (value: boolean) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
   deleteRegisterProvider: (index: number) => void;
@@ -882,7 +929,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!silent) set({ isLoadingRegister: true });
     try {
       const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
     } catch (error) {
       if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
     } finally {
@@ -891,11 +938,30 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
+    set({
+      registerConfig: normalizeRegisterConfig(config),
+      isLoadingRegister: false,
+    });
   },
 
   setRegisterProxy: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
+  },
+
+  setRegisterProxyInputMode: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_input_mode: value } } : {});
+  },
+
+  setRegisterProxyUrl: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_url: value } } : {});
+  },
+
+  setRegisterProxyListText: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_list_text: value } } : {});
+  },
+
+  setRegisterProxyRefreshInterval: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_refresh_interval: Number(value) || 0 } } : {});
   },
 
   setRegisterTotal: (value) => {
@@ -927,6 +993,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       registerConfig: {
         ...state.registerConfig,
         mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
+      },
+    } : {});
+  },
+
+  setRegisterMailApiUseRegisterProxy: (value) => {
+    set((state) => state.registerConfig ? {
+      registerConfig: {
+        ...state.registerConfig,
+        mail: { ...state.registerConfig.mail, api_use_register_proxy: value },
       },
     } : {});
   },
@@ -972,17 +1047,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!registerConfig) return;
     try {
       set({ isSavingRegister: true });
-      const data = await updateRegisterConfig({
-        mail: registerConfig.mail,
-        proxy: registerConfig.proxy.trim(),
-        total: Math.max(1, Number(registerConfig.total) || 1),
-        threads: Math.max(1, Number(registerConfig.threads) || 1),
-        mode: registerConfig.mode,
-        target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-        target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-        check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-      });
-      set({ registerConfig: data.register });
+      const data = await updateRegisterConfig(buildRegisterPayload(registerConfig));
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success("注册配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存注册配置失败");
@@ -997,19 +1063,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       if (!registerConfig.enabled) {
-        await updateRegisterConfig({
-          mail: registerConfig.mail,
-          proxy: registerConfig.proxy.trim(),
-          total: Math.max(1, Number(registerConfig.total) || 1),
-          threads: Math.max(1, Number(registerConfig.threads) || 1),
-          mode: registerConfig.mode,
-          target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
-          target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-          check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
-        });
+        await updateRegisterConfig(buildRegisterPayload(registerConfig));
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success(registerConfig.enabled ? "注册任务已停止" : "注册任务已启动");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "切换注册状态失败");
@@ -1022,7 +1079,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetRegisterApi();
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success("注册统计已重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置注册统计失败");
@@ -1035,7 +1092,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetOutlookPoolApi(scope);
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");

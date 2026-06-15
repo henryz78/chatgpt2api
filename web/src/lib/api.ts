@@ -331,9 +331,14 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
+    api_use_register_proxy: boolean;
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
+  proxy_input_mode: "single" | "url" | "text";
+  proxy_url: string;
+  proxy_list_text: string;
+  proxy_refresh_interval: number;
   total: number;
   threads: number;
   mode: "total" | "quota" | "available";
@@ -352,6 +357,11 @@ export type RegisterConfig = {
     success_rate?: number;
     current_quota?: number;
     current_available?: number;
+    current_proxy?: string;
+    proxy_pool_count?: number;
+    proxy_source?: string;
+    proxy_pool_last_error?: string;
+    proxy_pool_last_fetch?: number;
     started_at?: string;
     updated_at?: string;
     finished_at?: string;

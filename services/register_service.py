@@ -11,6 +11,7 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.register import mail_provider, openai_register
+from services.register.proxy_pool import normalize_proxy_input_mode, normalize_proxy_refresh_interval
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
@@ -37,11 +38,51 @@ def _now() -> str:
 
 
 _PROXY_POOL_CONFIG_KEYS = ("proxy_input_mode", "proxy_url", "proxy_list_text", "proxy_refresh_interval")
+_PROXY_POOL_STATS_KEYS = ("current_proxy", "proxy_pool_count", "proxy_source", "proxy_pool_last_error", "proxy_pool_last_fetch")
 _SYNC_KEYS = ("mail", "proxy", *_PROXY_POOL_CONFIG_KEYS, "total", "threads")
+_BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
+_BOOL_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def _safe_bool(value: object, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in _BOOL_TRUE_VALUES:
+        return True
+    if text in _BOOL_FALSE_VALUES:
+        return False
+    return fallback
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {
+        **openai_register.config,
+        "mode": "total",
+        "target_quota": 100,
+        "target_available": 10,
+        "check_interval": 5,
+        "enabled": False,
+        "stats": {
+            "success": 0,
+            "fail": 0,
+            "done": 0,
+            "running": 0,
+            "threads": openai_register.config["threads"],
+            "elapsed_seconds": 0,
+            "avg_seconds": 0,
+            "success_rate": 0,
+            "current_quota": 0,
+            "current_available": 0,
+            "current_proxy": "",
+            "proxy_pool_count": 0,
+            "proxy_source": "single",
+            "proxy_pool_last_error": "",
+            "proxy_pool_last_fetch": 0,
+        },
+    }
 
 
 def _normalize(raw: dict) -> dict:
@@ -54,15 +95,24 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
-    cfg["proxy_input_mode"] = str(cfg.get("proxy_input_mode") or "single").strip()
     cfg["proxy_url"] = str(cfg.get("proxy_url") or "").strip()
     cfg["proxy_list_text"] = str(cfg.get("proxy_list_text") or "")
-    try:
-        cfg["proxy_refresh_interval"] = max(10, int(cfg.get("proxy_refresh_interval") or 120))
-    except (OverflowError, TypeError, ValueError):
-        cfg["proxy_refresh_interval"] = 120
-    if isinstance(cfg.get("mail"), dict):
-        cfg["mail"].pop("proxy", None)
+    raw_proxy_input_mode = str(raw.get("proxy_input_mode") or "").strip().lower()
+    proxy_input_mode = normalize_proxy_input_mode(raw_proxy_input_mode)
+    if raw_proxy_input_mode not in {"single", "url", "text"}:
+        if cfg["proxy_url"]:
+            proxy_input_mode = "url"
+        elif "\n" in cfg["proxy"] or "\r" in cfg["proxy"]:
+            proxy_input_mode = "text"
+            cfg["proxy_list_text"] = cfg["proxy"]
+            cfg["proxy"] = ""
+    cfg["proxy_input_mode"] = proxy_input_mode
+    cfg["proxy_refresh_interval"] = normalize_proxy_refresh_interval(cfg.get("proxy_refresh_interval"))
+    default_mail = openai_register.config.get("mail") if isinstance(openai_register.config.get("mail"), dict) else {}
+    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+    cfg["mail"] = {**default_mail, **mail}
+    cfg["mail"]["api_use_register_proxy"] = _safe_bool(cfg["mail"].get("api_use_register_proxy"), True)
+    cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -75,11 +125,15 @@ class RegisterService:
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
+        self._starting = False
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
-            self.start()
+            try:
+                self.start()
+            except RuntimeError:
+                pass
 
     def _load(self) -> dict:
         try:
@@ -93,6 +147,7 @@ class RegisterService:
 
     def get(self) -> dict:
         with self._lock:
+            self._merge_proxy_pool_stats_locked()
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
         return snapshot
@@ -176,12 +231,15 @@ class RegisterService:
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in _SYNC_KEYS})
-            openai_register.configure_proxy_pool(fetch_now=False)
+            self._bump(**openai_register.configure_proxy_pool(fetch_now=False))
             self._save()
             return self.get()
 
     def start(self) -> dict:
         with self._lock:
+            if self._starting:
+                self._save()
+                return self.get()
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
@@ -193,16 +251,53 @@ class RegisterService:
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in _SYNC_KEYS})
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
+                openai_register.stats.update(
+                    {
+                        "done": 0,
+                        "success": 0,
+                        "fail": 0,
+                        "start_time": time.time(),
+                        "current_proxy": "",
+                        "proxy_pool_count": 0,
+                        "proxy_source": self._config["proxy_input_mode"],
+                        "proxy_pool_last_error": "",
+                        "proxy_pool_last_fetch": 0,
+                    }
+                )
+            self._starting = True
             self._save()
 
-        openai_register.configure_proxy_pool(fetch_now=True)
+        try:
+            proxy_stats = openai_register.configure_proxy_pool(fetch_now=False)
+            proxy_stats = openai_register.prepare_proxy_pool()
+        except RuntimeError as error:
+            with self._lock:
+                message = str(error)
+                with openai_register.stats_lock:
+                    proxy_stats = {key: openai_register.stats.get(key) for key in _PROXY_POOL_STATS_KEYS}
+                self._config["enabled"] = False
+                self._config["stats"].update(
+                    {
+                        **proxy_stats,
+                        "running": 0,
+                        "proxy_pool_last_error": message,
+                        "updated_at": _now(),
+                        "finished_at": _now(),
+                    }
+                )
+                self._starting = False
+                self._save()
+                self._append_log(f"注册任务启动失败：{message}", "red")
+            raise
 
         with self._lock:
+            self._config["stats"].update(proxy_stats)
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
+            self._starting = False
             proxy_mode = self._config.get('proxy_input_mode', 'single')
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}，代理模式={proxy_mode}", "yellow")
+            self._save()
             return self.get()
 
     def stop(self) -> dict:
@@ -218,7 +313,20 @@ class RegisterService:
             self._logs = []
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
+                openai_register.stats.update(
+                    {
+                        "done": 0,
+                        "success": 0,
+                        "fail": 0,
+                        "start_time": 0.0,
+                        "current_proxy": "",
+                        "proxy_pool_count": 0,
+                        "proxy_source": self._config.get("proxy_input_mode", "single"),
+                        "proxy_pool_last_error": "",
+                        "proxy_pool_last_fetch": 0,
+                    }
+                )
+            self._config["stats"].update({key: openai_register.stats.get(key) for key in _PROXY_POOL_STATS_KEYS})
             self._save()
             return self.get()
 
@@ -269,6 +377,7 @@ class RegisterService:
 
     def _bump(self, **updates) -> None:
         with self._lock:
+            self._merge_proxy_pool_stats_locked()
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")
@@ -285,6 +394,13 @@ class RegisterService:
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
             self._save()
+
+    def _merge_proxy_pool_stats_locked(self) -> None:
+        stats = self._config.get("stats")
+        if not isinstance(stats, dict):
+            return
+        with openai_register.stats_lock:
+            stats.update({key: openai_register.stats.get(key) for key in _PROXY_POOL_STATS_KEYS})
 
     def _run(self) -> None:
         threads = int(self.get()["threads"])

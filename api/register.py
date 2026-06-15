@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -46,7 +46,10 @@ def create_router() -> APIRouter:
     @router.post("/api/register/start")
     async def start_register(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"register": register_service.start()}
+        try:
+            return {"register": register_service.start()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.post("/api/register/stop")
     async def stop_register(authorization: str | None = Header(default=None)):
