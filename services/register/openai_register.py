@@ -19,6 +19,7 @@ from curl_cffi import requests
 from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+from services.register.proxy_pool import RegisterProxyPool
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -26,16 +27,36 @@ config = {
         "request_timeout": 30,
         "wait_timeout": 30,
         "wait_interval": 2,
+        "api_use_register_proxy": True,
         "providers": [],
     },
     "proxy": "",
+    "proxy_input_mode": "single",
+    "proxy_url": "",
+    "proxy_list_text": "",
+    "proxy_refresh_interval": 120,
     "total": 10,
     "threads": 3,
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
+    config.update(
+        {
+            key: saved_config[key]
+            for key in (
+                "mail",
+                "proxy",
+                "proxy_input_mode",
+                "proxy_url",
+                "proxy_list_text",
+                "proxy_refresh_interval",
+                "total",
+                "threads",
+            )
+            if key in saved_config
+        }
+    )
 except Exception:
     pass
 
@@ -55,8 +76,19 @@ sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
-stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
+stats = {
+    "done": 0,
+    "success": 0,
+    "fail": 0,
+    "start_time": 0.0,
+    "current_proxy": "",
+    "proxy_pool_count": 0,
+    "proxy_source": "single",
+    "proxy_pool_last_error": "",
+    "proxy_pool_last_fetch": 0,
+}
 register_log_sink = None
+proxy_pool = RegisterProxyPool()
 
 common_headers = {
     "accept": "application/json",
@@ -210,8 +242,24 @@ def _is_cloudflare_challenge(resp) -> bool:
     )
 
 
-def _mail_config() -> dict:
-    return {**config["mail"], "proxy": config["proxy"]}
+def _truthy(value: object, fallback: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return fallback
+
+
+def _mail_config(register_proxy: str = "") -> dict:
+    mail = config["mail"] if isinstance(config.get("mail"), dict) else {}
+    use_register_proxy = _truthy(mail.get("api_use_register_proxy"), True)
+    proxy = str(register_proxy or "").strip() if use_register_proxy else ""
+    return {**mail, "api_use_register_proxy": use_register_proxy, "proxy": proxy}
 
 
 def _authorize_landed_page(resp) -> str:
@@ -235,12 +283,12 @@ def _authorize_landed_page(resp) -> str:
     return ""
 
 
-def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(_mail_config(), username)
+def create_mailbox(username: str | None = None, register_proxy: str = "") -> dict:
+    return mail_provider.create_mailbox(_mail_config(register_proxy), username)
 
 
-def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(_mail_config(), mailbox)
+def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
+    return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox)
 
 
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
@@ -569,7 +617,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox()
+        mailbox = create_mailbox(register_proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -583,7 +631,7 @@ class PlatformRegistrar:
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
-            code = wait_for_code(mailbox)
+            code = wait_for_code(mailbox, register_proxy=self.proxy)
             if not code:
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
@@ -605,9 +653,63 @@ class PlatformRegistrar:
         }
 
 
+def configure_proxy_pool(fetch_now: bool = False) -> dict[str, object]:
+    """Re-configure the global proxy pool from the current register config."""
+    try:
+        refresh_interval = int(config.get("proxy_refresh_interval") or 120)
+    except (OverflowError, TypeError, ValueError):
+        refresh_interval = 120
+    state = proxy_pool.configure(
+        mode=str(config.get("proxy_input_mode") or "single"),
+        single_proxy=str(config.get("proxy") or ""),
+        proxy_url=str(config.get("proxy_url") or ""),
+        proxy_list_text=str(config.get("proxy_list_text") or ""),
+        refresh_interval=refresh_interval,
+        fetch_now=fetch_now,
+    )
+    with stats_lock:
+        stats["proxy_pool_count"] = state.count
+        stats["proxy_source"] = state.source
+        stats["proxy_pool_last_error"] = state.last_error
+        stats["proxy_pool_last_fetch"] = state.last_fetch
+    return {
+        "proxy_pool_count": state.count,
+        "proxy_source": state.source,
+        "proxy_pool_last_error": state.last_error,
+        "proxy_pool_last_fetch": state.last_fetch,
+    }
+
+
+def prepare_proxy_pool() -> dict[str, object]:
+    """Pre-flight: ensure the proxy pool is ready (fetch URL proxies etc.)."""
+    state = proxy_pool.prepare()
+    with stats_lock:
+        stats["current_proxy"] = state.current_proxy
+        stats["proxy_pool_count"] = state.count
+        stats["proxy_source"] = state.source
+        stats["proxy_pool_last_error"] = state.last_error
+        stats["proxy_pool_last_fetch"] = state.last_fetch
+    return {
+        "proxy_pool_count": state.count,
+        "proxy_source": state.source,
+        "proxy_pool_last_error": state.last_error,
+        "proxy_pool_last_fetch": state.last_fetch,
+    }
+
+
 def worker(index: int) -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+    selection = proxy_pool.next_proxy()
+    with stats_lock:
+        stats["current_proxy"] = selection.proxy
+        stats["proxy_pool_count"] = selection.count
+        stats["proxy_source"] = selection.source
+        stats["proxy_pool_last_error"] = selection.last_error
+        stats["proxy_pool_last_fetch"] = selection.last_fetch
+    if str(config.get("proxy_input_mode") or "single") in {"url", "text"} and not selection.proxy:
+        step(index, selection.last_error or "No proxy available, skipping", "yellow")
+        return {"ok": False, "index": index, "error": selection.last_error or "no_proxy"}
+    registrar = PlatformRegistrar(selection.proxy)
     try:
         step(index, "任务启动")
         result = registrar.register(index)
