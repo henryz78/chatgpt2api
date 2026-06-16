@@ -4,7 +4,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, public_model_id
 
 
 def list_models() -> dict[str, Any]:
@@ -12,6 +12,20 @@ def list_models() -> dict[str, Any]:
     data = result.get("data")
     if not isinstance(data, list):
         return result
+    normalized_data: list[dict[str, Any]] = []
+    seen_normalized: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = public_model_id(item.get("id"))
+        if not model_id or model_id in seen_normalized:
+            continue
+        next_item = dict(item)
+        next_item["id"] = model_id
+        next_item["root"] = public_model_id(next_item.get("root") or model_id)
+        normalized_data.append(next_item)
+        seen_normalized.add(model_id)
+    result["data"] = data = normalized_data
     seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
     dynamic_models: set[str] = set()
     accounts = account_service.list_accounts()

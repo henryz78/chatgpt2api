@@ -14,6 +14,29 @@ BASE_URL = "http://localhost:8000"
 
 
 class ModelListTests(unittest.TestCase):
+    def test_list_models_exposes_dotted_gpt_version_ids(self):
+        with (
+            mock.patch.object(
+                openai_v1_models.OpenAIBackendAPI,
+                "list_models",
+                return_value={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-5-1", "object": "model", "created": 0, "owned_by": "chatgpt", "permission": [], "root": "gpt-5-1", "parent": None},
+                        {"id": "gpt-5-3-mini", "object": "model", "created": 0, "owned_by": "chatgpt", "permission": [], "root": "gpt-5-3-mini", "parent": None},
+                    ],
+                },
+            ),
+            mock.patch.object(openai_v1_models.account_service, "list_accounts", return_value=[]),
+        ):
+            result = openai_v1_models.list_models()
+
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("gpt-5.1", ids)
+        self.assertIn("gpt-5.3-mini", ids)
+        self.assertNotIn("gpt-5-1", ids)
+        self.assertNotIn("gpt-5-3-mini", ids)
+
     def test_list_models_only_returns_image_models_backed_by_account_types(self):
         with (
             mock.patch.object(

@@ -22,7 +22,15 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    UpstreamHTTPError,
+    ensure_ok,
+    iter_sse_payloads,
+    new_uuid,
+    public_model_id,
+    split_image_model,
+    upstream_model_id,
+)
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -56,13 +64,13 @@ DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
-SEARCH_MODEL = "gpt-5-5"
+SEARCH_MODEL = "gpt-5.5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
-EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
+EDITABLE_FILE_MODEL = "gpt-5.5-thinking"
 EDITABLE_FILE_THINKING_EFFORT = "extended"
 EDITABLE_FILE_TIMEOUT_SECS = 1200.0
 EDITABLE_FILE_POLL_INTERVAL_SECS = 5.0
@@ -479,7 +487,7 @@ class OpenAIBackendAPI:
         return {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
-            "model": model,
+            "model": upstream_model_id(model),
             "parent_message_id": new_uuid(),
             "conversation_mode": {"kind": "primary_assistant"},
             "conversation_origin": None,
@@ -513,7 +521,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            return upstream_model_id("gpt-5.3")
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -1258,7 +1266,7 @@ class OpenAIBackendAPI:
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": "client-created-root",
-            "model": EDITABLE_FILE_MODEL,
+            "model": upstream_model_id(EDITABLE_FILE_MODEL),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -1326,7 +1334,7 @@ class OpenAIBackendAPI:
                 "action": "next",
                 "messages": [message],
                 "parent_message_id": "client-created-root",
-                "model": EDITABLE_FILE_MODEL,
+                "model": upstream_model_id(EDITABLE_FILE_MODEL),
                 "client_prepare_state": "sent",
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
@@ -1749,6 +1757,7 @@ class OpenAIBackendAPI:
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:
         path = "/backend-api/f/conversation/prepare"
+        upstream_model = upstream_model_id(model)
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
@@ -1756,7 +1765,7 @@ class OpenAIBackendAPI:
                 "action": "next",
                 "fork_from_shared_post": False,
                 "parent_message_id": "client-created-root",
-                "model": model,
+                "model": upstream_model,
                 "client_prepare_state": "success",
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
@@ -1778,6 +1787,7 @@ class OpenAIBackendAPI:
     def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> str:
         requirements = self._get_chat_requirements()
         path = "/backend-api/f/conversation"
+        upstream_model = upstream_model_id(model)
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
@@ -1797,7 +1807,7 @@ class OpenAIBackendAPI:
                     },
                 }],
                 "parent_message_id": "client-created-root",
-                "model": model,
+                "model": upstream_model,
                 "client_prepare_state": "success",
                 "timezone_offset_min": -480,
                 "timezone": "Asia/Shanghai",
@@ -2633,16 +2643,17 @@ class OpenAIBackendAPI:
             if not isinstance(item, dict):
                 continue
             slug = str(item.get("slug", "")).strip()
-            if not slug or slug in seen:
+            model_id = public_model_id(slug)
+            if not model_id or model_id in seen:
                 continue
-            seen.add(slug)
+            seen.add(model_id)
             data.append({
-                "id": slug,
+                "id": model_id,
                 "object": "model",
                 "created": int(item.get("created") or 0),
                 "owned_by": str(item.get("owned_by") or "chatgpt"),
                 "permission": [],
-                "root": slug,
+                "root": model_id,
                 "parent": None,
             })
         data.sort(key=lambda item: item["id"])

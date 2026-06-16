@@ -24,6 +24,8 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+PUBLIC_GPT_VERSION_RE = re.compile(r"^gpt-(\d+)-(\d+)(?=$|-)")
+UPSTREAM_GPT_VERSION_RE = re.compile(r"^gpt-(\d+)\.(\d+)(?=$|-)")
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
@@ -104,6 +106,16 @@ def normalize_json_edit_images(image: object = None, images: object = None) -> l
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+def public_model_id(model: object) -> str:
+    """Return the public OpenAI-style model id for legacy hyphenated GPT versions."""
+    return PUBLIC_GPT_VERSION_RE.sub(r"gpt-\1.\2", str(model or "").strip(), count=1)
+
+
+def upstream_model_id(model: object) -> str:
+    """Return the legacy ChatGPT web slug for public dotted GPT model ids."""
+    return UPSTREAM_GPT_VERSION_RE.sub(r"gpt-\1-\2", str(model or "").strip(), count=1)
 
 
 def split_image_model(model: object) -> tuple[str | None, str | None]:
