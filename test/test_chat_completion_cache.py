@@ -8,6 +8,7 @@ import base64
 from fastapi import HTTPException
 
 from services.config import config
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
@@ -145,6 +146,83 @@ class ChatCompletionCacheTests(unittest.TestCase):
                 {"role": "user", "content": "next prompt"},
             ],
         )
+
+    def test_chat_completions_passes_reasoning_effort_to_text_request(self) -> None:
+        captured = {}
+
+        def fake_collect_text(_backend, request):
+            captured["thinking_effort"] = request.thinking_effort
+            return "ok"
+
+        body = {
+            "model": "auto",
+            "reasoning_effort": "xhigh",
+            "messages": [{"role": "user", "content": "think harder"}],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+        ):
+            response = openai_v1_chat_complete.handle(body)
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(captured["thinking_effort"], "extended")
+
+    def test_chat_completions_thinking_effort_takes_priority(self) -> None:
+        captured = {}
+
+        def fake_collect_text(_backend, request):
+            captured["thinking_effort"] = request.thinking_effort
+            return "ok"
+
+        body = {
+            "model": "auto",
+            "thinking_effort": "high",
+            "reasoning_effort": "low",
+            "reasoning": {"effort": "medium"},
+            "messages": [{"role": "user", "content": "use explicit thinking effort"}],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+        ):
+            openai_v1_chat_complete.handle(body)
+
+        self.assertEqual(captured["thinking_effort"], "high")
+
+    def test_responses_passes_nested_reasoning_effort_to_text_request(self) -> None:
+        captured = {}
+
+        def fake_stream_text_deltas(_backend, request):
+            captured["thinking_effort"] = request.thinking_effort
+            yield "ok"
+
+        body = {
+            "model": "auto",
+            "reasoning": {"effort": "xhigh"},
+            "input": "think harder",
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream_text_deltas),
+        ):
+            response = openai_v1_response.handle(body)
+
+        self.assertEqual(response["output"][0]["content"][0]["text"], "ok")
+        self.assertEqual(captured["thinking_effort"], "extended")
+
+    def test_conversation_payload_includes_valid_thinking_effort_only(self) -> None:
+        backend = OpenAIBackendAPI()
+        messages = [{"role": "user", "content": "hello"}]
+
+        with_effort = backend._conversation_payload(messages, "auto", "Asia/Shanghai", thinking_effort="xhigh")
+        without_effort = backend._conversation_payload(messages, "auto", "Asia/Shanghai", thinking_effort="weird")
+
+        self.assertEqual(with_effort["thinking_effort"], "extended")
+        self.assertNotIn("thinking_effort", without_effort)
 
     def test_chat_completion_usage_includes_cached_tokens(self) -> None:
         with (

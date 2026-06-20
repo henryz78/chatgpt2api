@@ -297,6 +297,7 @@ class ConversationRequest:
     model: str = "auto"
     prompt: str = ""
     messages: list[dict[str, Any]] | None = None
+    thinking_effort: str = ""
     images: list[str] | None = None
     n: int = 1
     size: str | None = None
@@ -652,6 +653,7 @@ def conversation_events(
     messages: list[dict[str, Any]] | None = None,
     model: str = "auto",
     prompt: str = "",
+    thinking_effort: str = "",
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
@@ -665,6 +667,7 @@ def conversation_events(
         messages=normalized,
         model=model,
         prompt=final_prompt,
+        thinking_effort=thinking_effort,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
     )
@@ -686,7 +689,13 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             attempted_tokens.add(token)
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
-            for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
+            for event in conversation_events(
+                active_backend,
+                messages=request.messages,
+                model=request.model,
+                prompt=request.prompt,
+                thinking_effort=request.thinking_effort,
+            ):
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")

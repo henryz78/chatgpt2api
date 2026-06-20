@@ -482,9 +482,28 @@ class OpenAIBackendAPI:
             })
         return conversation_messages
 
-    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str) -> Dict[str, Any]:
-        """把标准 messages 构造成 web 对话请求体。"""
+    @staticmethod
+    def _normalize_thinking_effort(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"", "none"}:
+            return ""
         return {
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "extended",
+            "extended": "extended",
+        }.get(raw, "")
+
+    def _conversation_payload(
+            self,
+            messages: list[Dict[str, Any]],
+            model: str,
+            timezone: str,
+            thinking_effort: str = "",
+    ) -> Dict[str, Any]:
+        """把标准 messages 构造成 web 对话请求体。"""
+        payload: Dict[str, Any] = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": upstream_model_id(model),
@@ -514,6 +533,10 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        normalized_effort = self._normalize_thinking_effort(thinking_effort)
+        if normalized_effort:
+            payload["thinking_effort"] = normalized_effort
+        return payload
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
@@ -2487,6 +2510,7 @@ class OpenAIBackendAPI:
             messages: Optional[list[Dict[str, Any]]] = None,
             model: str = "auto",
             prompt: str = "",
+            thinking_effort: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
     ) -> Iterator[str]:
@@ -2499,7 +2523,7 @@ class OpenAIBackendAPI:
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone)
+        payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),

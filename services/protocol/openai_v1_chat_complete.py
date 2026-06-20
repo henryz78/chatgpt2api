@@ -115,11 +115,40 @@ def completion_response(
     }
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+def normalize_thinking_effort(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "none"}:
+        return ""
+    return {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "extended",
+        "extended": "extended",
+    }.get(raw, "")
+
+
+def parse_thinking_effort(body: dict[str, Any]) -> str:
+    if "thinking_effort" in body:
+        return normalize_thinking_effort(body.get("thinking_effort"))
+    if "reasoning_effort" in body:
+        return normalize_thinking_effort(body.get("reasoning_effort"))
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        return normalize_thinking_effort(reasoning.get("effort"))
+    return ""
+
+
+def stream_text_chat_completion(
+        backend,
+        messages: list[dict[str, Any]],
+        model: str,
+        thinking_effort: str = "",
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     for delta_text in stream_text_deltas(backend, request):
         if not sent_role:
             sent_role = True
@@ -313,8 +342,9 @@ def _text_with_tools_response(
     tools: list[dict[str, Any]],
     tool_choice: Any,
     parallel_tool_calls: bool,
+    thinking_effort: str = "",
 ) -> dict[str, Any]:
-    full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
+    full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort))
     raw_tool_calls = parse_tool_calls(full_text)
     tool_calls, err = enforce_tool_choice(raw_tool_calls, tool_choice, tools, parallel_tool_calls)
 
@@ -332,8 +362,9 @@ def _text_with_tools_stream(
     tools: list[dict[str, Any]],
     tool_choice: Any,
     parallel_tool_calls: bool,
+    thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
-    full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
+    full_text = collect_text(text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort))
     raw_tool_calls = parse_tool_calls(full_text)
     tool_calls, err = enforce_tool_choice(raw_tool_calls, tool_choice, tools, parallel_tool_calls)
 
@@ -373,20 +404,22 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         if is_image_chat_request(body):
             return image_chat_events(body)
         model, messages, tools, tool_choice, parallel_tool_calls = text_chat_parts(body)
+        thinking_effort = parse_thinking_effort(body)
         if tools:
-            return _text_with_tools_stream(model, messages, tools, tool_choice, parallel_tool_calls)
+            return _text_with_tools_stream(model, messages, tools, tool_choice, parallel_tool_calls, thinking_effort)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
     model, messages, tools, tool_choice, parallel_tool_calls = text_chat_parts(body)
+    thinking_effort = parse_thinking_effort(body)
     if tools:
-        return _text_with_tools_response(model, messages, tools, tool_choice, parallel_tool_calls)
+        return _text_with_tools_response(model, messages, tools, tool_choice, parallel_tool_calls, thinking_effort)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     key = cache_key(body, messages, stream=False)
@@ -394,7 +427,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         key,
         lambda: completion_response(
             model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages)),
+            collect_text(text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
             messages=messages,
         ),
     )

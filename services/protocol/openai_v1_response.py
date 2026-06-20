@@ -266,6 +266,30 @@ def response_completed(
     return response
 
 
+def normalize_thinking_effort(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "none"}:
+        return ""
+    return {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "extended",
+        "extended": "extended",
+    }.get(raw, "")
+
+
+def parse_thinking_effort(body: dict[str, Any]) -> str:
+    if "thinking_effort" in body:
+        return normalize_thinking_effort(body.get("thinking_effort"))
+    if "reasoning_effort" in body:
+        return normalize_thinking_effort(body.get("reasoning_effort"))
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        return normalize_thinking_effort(reasoning.get("effort"))
+    return ""
+
+
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
@@ -276,6 +300,7 @@ def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]
 
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
     model = str(body.get("model") or "auto").strip() or "auto"
+    thinking_effort = parse_thinking_effort(body)
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
     response_id = f"resp_{uuid.uuid4().hex}"
     item_id = f"msg_{uuid.uuid4().hex}"
@@ -283,7 +308,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     full_text = ""
     yield response_created(response_id, model, created)
     yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     for delta in stream_text_deltas(backend, request):
         full_text += delta
         yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
