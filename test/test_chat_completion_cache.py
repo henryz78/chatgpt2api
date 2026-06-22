@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol import openai_v1_chat_complete, openai_v1_response
+from services.protocol import openai_search, openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
 from utils.helper import extract_image_from_message_content
@@ -461,6 +461,45 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(content["annotations"][0]["type"], "url_citation")
         self.assertEqual(content["annotations"][0]["url"], "https://example.com/news")
 
+    def test_responses_web_search_strips_call_prefix_from_output_text(self) -> None:
+        search_result = {
+            "answer": 'search("today news")Today news answer.',
+            "sources": [],
+        }
+        body = {
+            "model": "auto",
+            "input": "today news",
+            "tools": [{"type": "web_search"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result):
+            response = openai_v1_response.handle(body)
+
+        text = response["output"][1]["content"][0]["text"]
+        self.assertEqual(text, "Today news answer.")
+        self.assertNotIn('search("today news")', text)
+
+    def test_search_endpoint_strips_call_prefix_from_answer(self) -> None:
+        search_result = {
+            "answer": 'search({"query": "today (global) news"})Today news answer.',
+            "sources": [],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_search.account_service.get_text_access_token", return_value="token"),
+            mock.patch("services.protocol.openai_search.account_service.get_account", return_value={"email": "a@example.com"}),
+            mock.patch("services.protocol.openai_search.account_service.mark_text_used") as mark_used,
+            mock.patch("services.protocol.openai_search.OpenAIBackendAPI") as backend_cls,
+        ):
+            backend_cls.return_value.search.return_value = search_result
+            response = openai_search.handle({"prompt": "today news"})
+
+        backend_cls.assert_called_once_with("token")
+        backend_cls.return_value.search.assert_called_once_with("today news")
+        mark_used.assert_called_once_with("token")
+        self.assertEqual(response["answer"], "Today news answer.")
+        self.assertEqual(response["_account_email"], "a@example.com")
+
     def test_responses_web_search_tool_streams_search_events(self) -> None:
         search_result = {
             "answer": "Streamed search answer.",
@@ -521,6 +560,24 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertIn("Chat search answer.", message["content"])
         self.assertEqual(message["annotations"][0]["type"], "url_citation")
         self.assertEqual(message["annotations"][0]["url_citation"]["url"], "https://example.com/chat")
+
+    def test_chat_completions_web_search_strips_call_prefix_from_message_content(self) -> None:
+        search_result = {
+            "answer": 'search("today news")Today news answer.',
+            "sources": [],
+        }
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "today news"}],
+            "tools": [{"type": "web_search"}],
+        }
+
+        with mock.patch("services.protocol.openai_v1_chat_complete.run_web_search", return_value=search_result):
+            response = openai_v1_chat_complete.handle(body)
+
+        content = response["choices"][0]["message"]["content"]
+        self.assertEqual(content, "Today news answer.")
+        self.assertNotIn('search("today news")', content)
 
     def test_chat_completions_web_search_options_trigger_search(self) -> None:
         search_result = {

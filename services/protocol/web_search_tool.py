@@ -85,6 +85,45 @@ def _readable_annotation_part(parts: list[str]) -> str:
     return ""
 
 
+def strip_search_call_prefix(value: str) -> str:
+    text = str(value or "")
+    match = re.match(r"(?is)^\s*(?:search|web_search)\s*\(", text)
+    if not match:
+        return text
+
+    depth = 1
+    quote = ""
+    escaped = False
+    index = match.end()
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[index + 1:].lstrip()
+        index += 1
+
+    return text
+
+
+def clean_search_result(result: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(result)
+    if "answer" in cleaned:
+        cleaned["answer"] = clean_search_text(str(cleaned.get("answer") or ""))
+    return cleaned
+
+
 def clean_search_text(text: str) -> str:
     def replace_annotation(match: re.Match[str]) -> str:
         parts = [part.strip() for part in match.group(1).split("\ue202")]
@@ -102,6 +141,7 @@ def clean_search_text(text: str) -> str:
 
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
+    text = strip_search_call_prefix(text)
     return re.sub(r"\s+([.,;:!?])", r"\1", text).strip()
 
 
@@ -157,4 +197,4 @@ def run_web_search(query: str) -> dict[str, Any]:
     token = account_service.get_text_access_token()
     result = OpenAIBackendAPI(token).search(query)
     account_service.mark_text_used(token)
-    return result
+    return clean_search_result(result)

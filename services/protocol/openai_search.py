@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI, SEARCH_MODEL
+from services.protocol.web_search_tool import clean_search_result
 
 MODEL = SEARCH_MODEL
 
@@ -11,5 +12,6 @@ def handle(body: dict[str, object]) -> dict[str, object]:
     account = account_service.get_account(token) or {}
     result = OpenAIBackendAPI(token).search(str(body["prompt"]))
     account_service.mark_text_used(token)
+    result = clean_search_result(result)
     result["_account_email"] = str(account.get("email") or "")
     return result
