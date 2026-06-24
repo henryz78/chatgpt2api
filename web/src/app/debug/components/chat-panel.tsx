@@ -6,13 +6,17 @@ import { LoaderCircle, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { httpRequest } from "@/lib/request";
 
+import { buildChatCompletionRequest, type EffortField, type EffortLevel } from "./chat-panel-request";
 import { pretty, type ChatCompletionResponse, type ChatMessage } from "./types";
 
 export function ChatPanel() {
   const [model, setModel] = useState("auto");
+  const [effortField, setEffortField] = useState<EffortField>("thinking_effort");
+  const [effortLevel, setEffortLevel] = useState<EffortLevel>("");
   const [input, setInput] = useState("你好，先记住我的项目叫 chatgpt2api。");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [raw, setRaw] = useState<ChatCompletionResponse | null>(null);
@@ -28,7 +32,13 @@ export function ChatPanel() {
     setLoading(true);
     setError("");
     try {
-      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", { method: "POST", body: { model: model.trim() || "auto", messages: nextMessages } });
+      const request = buildChatCompletionRequest({
+        model,
+        messages: nextMessages,
+        effortField,
+        effortLevel,
+      });
+      const result = await httpRequest<ChatCompletionResponse>(request.path, request.options);
       setRaw(result);
       setMessages([...nextMessages, { role: "assistant", content: String(result.choices?.[0]?.message?.content || "") }]);
     } catch (err) {
@@ -54,6 +64,35 @@ export function ChatPanel() {
           <div className="space-y-2">
             <Label htmlFor="chat-model">Model</Label>
             <Input id="chat-model" value={model} onChange={(event) => setModel(event.target.value)} className="rounded-md border-stone-200/70 bg-transparent shadow-none dark:border-white/10" />
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="chat-effort-field">Effort field</Label>
+              <Select value={effortField} onValueChange={(value) => setEffortField(value as EffortField)}>
+                <SelectTrigger id="chat-effort-field" className="h-10 rounded-md border-stone-200/70 bg-transparent shadow-none dark:border-white/10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="thinking_effort">thinking_effort</SelectItem>
+                  <SelectItem value="reasoning_effort">reasoning_effort</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="chat-effort-level">Effort level</Label>
+              <Select value={effortLevel || "none"} onValueChange={(value) => setEffortLevel(value === "none" ? "" : value as EffortLevel)}>
+                <SelectTrigger id="chat-effort-level" className="h-10 rounded-md border-stone-200/70 bg-transparent shadow-none dark:border-white/10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">none</SelectItem>
+                  <SelectItem value="low">low</SelectItem>
+                  <SelectItem value="medium">medium</SelectItem>
+                  <SelectItem value="high">high</SelectItem>
+                  <SelectItem value="xhigh">xhigh</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
           <div className="space-y-2">
             <Label htmlFor="chat-input">Message</Label>
