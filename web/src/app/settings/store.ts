@@ -117,7 +117,7 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
-  const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
+  const canvas: Partial<ThirdPartyAppsSettings["infinite_canvas"]> = typeof source.infinite_canvas === "object" && source.infinite_canvas
     ? source.infinite_canvas
     : {};
   return {
@@ -179,6 +179,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_account_concurrency: Number(config.image_account_concurrency || 3),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
+    image_remove_conversation_after_result: Boolean(config.image_remove_conversation_after_result),
     image_settle_secs: Number(config.image_settle_secs || 2.0),
     image_timeout_retry_secs: Number(config.image_timeout_retry_secs || 30),
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
@@ -345,6 +346,7 @@ type SettingsStore = {
   setImageAccountConcurrency: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
+  setImageRemoveConversationAfterResult: (value: boolean) => void;
   setImageSettleSecs: (value: string) => void;
   setImageTimeoutRetrySecs: (value: string) => void;
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
@@ -496,6 +498,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
+        image_remove_conversation_after_result: Boolean(config.image_remove_conversation_after_result),
         image_settle_secs: Math.max(0.5, Number(config.image_settle_secs) || 2.0),
         image_timeout_retry_secs: Math.max(1, Number(config.image_timeout_retry_secs) || 30),
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
@@ -605,6 +608,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageCheckBeforeHitEnabled: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_check_before_hit_enabled: value } } : {});
+  },
+
+  setImageRemoveConversationAfterResult: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_remove_conversation_after_result: value } } : {});
   },
 
   setImageSettleSecs: (value) => {
